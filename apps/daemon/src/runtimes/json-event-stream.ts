@@ -842,6 +842,7 @@ export function createJsonEventStreamHandler(kind: ParserKind, onEvent: StreamEv
     }
 
     if (kind === 'opencode' && handleOpenCodeEvent(obj, onEvent, state)) return;
+    if (kind === 'dhcoder' && handleOpenCodeEvent(obj, onEvent, state)) return;
     if (kind === 'gemini' && handleGeminiEvent(obj, onEvent, state)) return;
     if (kind === 'kimi' && handleKimiEvent(obj, onEvent)) return;
     if (kind === 'cursor-agent' && handleCursorEvent(obj, onEvent, state)) return;

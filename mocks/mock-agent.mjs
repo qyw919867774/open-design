@@ -17,6 +17,7 @@
 
 import { pickRecording, readRecording } from './lib/recording-picker.mjs';
 import { renderAsOpencode }    from './lib/format-opencode.mjs';
+import { renderAsDhcoder }     from './lib/format-dhcoder.mjs';
 import { renderAsCodex }       from './lib/format-codex.mjs';
 import { renderAsClaude }      from './lib/format-claude.mjs';
 import { renderAsGemini }      from './lib/format-gemini.mjs';
@@ -76,7 +77,7 @@ async function main() {
   if (!opts.as) {
     failUsage(
       '--as <agent> required\n' +
-      '  supported: opencode | claude | amp | codex | gemini | cursor-agent |\n' +
+      '  supported: opencode | dhcoder | claude | amp | codex | gemini | cursor-agent |\n' +
       '             deepseek | qwen | grok | plain |\n' +
       '             kimi                                         (stream-json)\n' +
       '             devin | hermes | kilo | kiro | vibe          (ACP)\n' +
@@ -133,6 +134,7 @@ async function main() {
 
   switch (opts.as) {
     case 'opencode':     await renderAsOpencode(events, renderOpts);    break;
+    case 'dhcoder':      await renderAsDhcoder(events, renderOpts);     break;
     case 'codex':        await renderAsCodex(events, renderOpts);       break;
     case 'claude':
     case 'amp':          await renderAsClaude(events, renderOpts);      break;

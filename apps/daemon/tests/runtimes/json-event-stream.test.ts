@@ -10,6 +10,82 @@ function collectEvents(kind: string) {
   return { events, handler };
 }
 
+test('dhcoder stream emits text, tool events and usage', () => {
+  const { events, handler } = collectEvents('dhcoder');
+
+  handler.feed(
+    JSON.stringify({
+      type: 'step_start',
+      sessionID: 'ses_dhcoder_1',
+      part: { id: 'prt-1', messageID: 'msg-1', sessionID: 'ses_dhcoder_1', type: 'step-start' },
+    }) +
+    '\n' +
+    JSON.stringify({
+      type: 'tool_use',
+      sessionID: 'ses_dhcoder_1',
+      part: {
+        type: 'tool',
+        tool: 'bash',
+        callID: 'call-1',
+        state: {
+          input: { command: 'ls' },
+          status: 'completed',
+          output: '(no output)',
+        },
+      },
+    }) +
+    '\n' +
+    JSON.stringify({
+      type: 'text',
+      sessionID: 'ses_dhcoder_1',
+      part: { type: 'text', text: 'Done.', time: { start: 1, end: 2 } },
+    }) +
+    '\n' +
+    JSON.stringify({
+      type: 'step_finish',
+      sessionID: 'ses_dhcoder_1',
+      part: {
+        type: 'step-finish',
+        tokens: { total: 100, input: 80, output: 20, reasoning: 5, cache: { read: 2, write: 1 } },
+        cost: 0.001,
+      },
+    }) +
+    '\n',
+  );
+
+  assert.deepEqual(events, [
+    { type: 'status', label: 'running', sessionId: 'ses_dhcoder_1' },
+    { type: 'tool_use', id: 'call-1', name: 'bash', input: { command: 'ls' } },
+    { type: 'tool_result', toolUseId: 'call-1', content: '(no output)', isError: false },
+    { type: 'text_delta', delta: 'Done.' },
+    {
+      type: 'usage',
+      usage: {
+        input_tokens: 80,
+        output_tokens: 20,
+        thought_tokens: 5,
+        cached_read_tokens: 2,
+        cached_write_tokens: 1,
+      },
+      costUsd: 0.001,
+    },
+  ]);
+});
+
+test('dhcoder stream surfaces structured errors as error events', () => {
+  const { events, handler } = collectEvents('dhcoder');
+
+  const errorLine = JSON.stringify({
+    type: 'error',
+    error: { data: { message: 'DHcoder auth failed: not logged in' } },
+  });
+  handler.feed(errorLine + '\n');
+
+  assert.deepEqual(events, [
+    { type: 'error', message: 'DHcoder auth failed: not logged in', raw: errorLine },
+  ]);
+});
+
 test('opencode json stream emits text and usage events', () => {
   const { events, handler } = collectEvents('opencode');
 

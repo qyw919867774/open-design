@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Mock DHcoder CLI wrapper. Routes to the shared mock agent, replaying traces
+# in DHcoder's JSONL event shape (which is identical to OpenCode's).
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec node "${SCRIPT_DIR}/../mock-agent.mjs" --as dhcoder "$@"

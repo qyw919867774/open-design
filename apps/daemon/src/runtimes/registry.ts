@@ -9,6 +9,7 @@ import { traeCliAgentDef } from './defs/trae-cli.js';
 import { grokBuildAgentDef } from './defs/grok-build.js';
 import { kimiAgentDef } from './defs/kimi.js';
 import { cursorAgentDef } from './defs/cursor-agent.js';
+import { dhcoderAgentDef } from './defs/dhcoder.js';
 import { qwenAgentDef } from './defs/qwen.js';
 import { qoderAgentDef } from './defs/qoder.js';
 import { copilotAgentDef } from './defs/copilot.js';
@@ -30,6 +31,7 @@ const BASE_AGENT_DEFS: RuntimeAgentDef[] = [
   amrAgentDef,
   claudeAgentDef,
   codexAgentDef,
+  dhcoderAgentDef,
   devinAgentDef,
   geminiAgentDef,
   opencodeAgentDef,

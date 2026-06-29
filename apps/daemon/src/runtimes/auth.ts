@@ -52,6 +52,9 @@ const ANTIGRAVITY_QUOTA_GUIDANCE =
 const REASONIX_AUTH_GUIDANCE =
   'DeepSeek Reasonix is installed but is not authenticated. Add your API key in `~/.reasonix/config.json` under `apiKey`, or expose DEEPSEEK_API_KEY to the Open Design daemon process, then retry. If Open Design is launched outside an interactive shell, shell rc files such as ~/.zshrc may not be loaded.';
 
+const DHCODER_AUTH_GUIDANCE =
+  'DHcoder is installed but is not authenticated. Run `dhcoder login` in a terminal, then rescan. If Open Design was launched outside an interactive shell, your shell rc files (e.g. ~/.zshrc) may not be loaded into its environment.';
+
 const CLAUDE_AUTH_GUIDANCE =
   'Claude Code is installed but is not authenticated. Run `claude auth login` or open `claude` and complete login in a terminal, then rescan. If Open Design was launched outside an interactive shell, your shell rc files (e.g. ~/.zshrc) may not be loaded into its environment.';
 
@@ -73,6 +76,10 @@ export function antigravityQuotaGuidance(): string {
 
 export function reasonixAuthGuidance(): string {
   return REASONIX_AUTH_GUIDANCE;
+}
+
+export function dhcoderAuthGuidance(): string {
+  return DHCODER_AUTH_GUIDANCE;
 }
 
 export function claudeAuthGuidance(): string {
@@ -137,6 +144,17 @@ export function isReasonixAuthFailureText(text: string): boolean {
   );
 }
 
+export function isDhcoderAuthFailureText(text: string): boolean {
+  const value = String(text || '');
+  if (!value.trim()) return false;
+  return (
+    /not logged in/i.test(value) ||
+    /authentication required/i.test(value) ||
+    /please run dhcoder login/i.test(value) ||
+    /dhcoder login/i.test(value)
+  );
+}
+
 export function isClaudeAuthFailureText(text: string): boolean {
   const value = String(text || '');
   if (!value.trim()) return false;
@@ -197,6 +215,13 @@ export function classifyAgentAuthFailure(
     return {
       status: 'missing',
       message: reasonixAuthGuidance(),
+    };
+  }
+  if (agentId === 'dhcoder') {
+    if (!isDhcoderAuthFailureText(text)) return null;
+    return {
+      status: 'missing',
+      message: dhcoderAuthGuidance(),
     };
   }
   return null;
@@ -310,6 +335,7 @@ const TAILORED_AUTH_AGENTS = new Set([
   'deepseek',
   'antigravity',
   'reasonix',
+  'dhcoder',
 ]);
 
 function hasNonEmptyEnv(env: RuntimeEnv, keys: string[]): boolean {
