@@ -621,11 +621,7 @@
   inset: auto;
   width: 30px;
   height: 30px;
-  object-fit: cover;
-  border-radius: var(--radius);
   display: block;
-  user-select: none;
-  -webkit-user-drag: none;
   pointer-events: none;
 }
 .entry-nav-rail__btn {
@@ -651,6 +647,15 @@
   background: color-mix(in srgb, var(--accent) 12%, var(--bg-panel));
   color: var(--accent);
   border-color: color-mix(in srgb, var(--accent) 10%, var(--bg-panel));
+}
+.entry-nav-rail__btn:disabled {
+  cursor: default;
+  opacity: 0.55;
+}
+.entry-nav-rail__btn:disabled:hover {
+  background: transparent;
+  color: var(--text-muted);
+  border-color: transparent;
 }
 .entry-nav-rail__btn.is-active {
   background: var(--accent-tint);
@@ -751,7 +756,13 @@
   background: var(--bg);
   isolation: isolate;
 }
-.entry-main__topbar:has(.entry-settings-menu__popover) {
+/* The topbar is an isolated sticky stacking context at z-index 10, so a
+   child popover's own z-index cannot escape it. While a topbar popover or
+   the updater's "update ready" prompt is open, lift the whole topbar above
+   raised page surfaces (e.g. the home composer card at z-index 1700 when
+   its agent picker is open) so the prompt paints on top. */
+.entry-main__topbar:has(.entry-settings-menu__popover),
+.entry-main__topbar:has(.updater-popup) {
   z-index: 1900;
 }
 .entry-main__topbar::before {
@@ -1345,6 +1356,9 @@
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
+  /* Open Design renders as `.inline-switcher__account`; keep the third-party
+     CLI grid after that account row even though their source order differs. */
+  order: 1;
 }
 .inline-switcher__agent-row {
   display: flex;
@@ -1462,6 +1476,190 @@
   transform: translateY(0);
 }
 
+/* Account row: Open Design login/plan, lifted out of the agent card so the
+   agent name is never truncated. */
+.inline-switcher__account {
+  order: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  background: var(--bg-subtle);
+  transition: background-color 120ms var(--ease-out),
+    border-color 120ms var(--ease-out);
+}
+/* The Open Design entry is also the agent selector now: hovering the clickable
+   area previews selectability, and the active agent gets the same accent
+   highlight the grid rows use. */
+.inline-switcher__account:has(.inline-switcher__account-select:hover):not(.is-active) {
+  background: var(--bg-panel);
+  border-color: var(--border);
+}
+.inline-switcher__account.is-active {
+  border-color: color-mix(in srgb, var(--accent) 38%, var(--border));
+  background: color-mix(in srgb, var(--bg-subtle) 82%, var(--accent-tint));
+}
+.inline-switcher__account.is-active:has(.inline-switcher__account-select:hover) {
+  border-color: color-mix(in srgb, var(--accent) 34%, var(--border));
+  background: color-mix(in srgb, var(--bg-panel) 74%, var(--accent-tint));
+}
+.inline-switcher__account-id {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-strong);
+}
+/* The icon+name+plan+balance block is the radio control that selects Open
+   Design; the upgrade / sign-in buttons stay siblings so they never nest in
+   this button. */
+.inline-switcher__account-select {
+  flex: 1 1 auto;
+  appearance: none;
+  border: none;
+  background: none;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.inline-switcher__account-id-icon {
+  position: relative;
+  flex: 0 0 auto;
+  display: inline-flex;
+}
+.inline-switcher__amr-reminder-dot--account {
+  top: -1px;
+  right: -1px;
+}
+.inline-switcher__account-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.inline-switcher__account-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.inline-switcher__account-name-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+/* Balance shown as a muted subtitle line under the Open Design name. Each
+   stat is "label value"; the gap (not a literal separator) keeps them apart. */
+.inline-switcher__account-subtitle {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 2px 14px;
+  min-width: 0;
+}
+.inline-switcher__account-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 4px;
+}
+.inline-switcher__account-stat-label {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+.inline-switcher__account-stat-value {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-strong);
+  font-variant-numeric: tabular-nums;
+  text-transform: capitalize;
+}
+.inline-switcher__account-upgrade {
+  flex: 0 0 auto;
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  box-shadow:
+    0 1px 2px color-mix(in srgb, var(--accent) 45%, transparent),
+    inset 0 1px 0 color-mix(in srgb, #fff 20%, transparent);
+  transition:
+    transform 150ms cubic-bezier(0.23, 1, 0.32, 1),
+    background-color 150ms ease,
+    box-shadow 150ms ease;
+}
+@media (hover: hover) and (pointer: fine) {
+  .inline-switcher__account-upgrade:hover:not(:disabled) {
+    background: var(--accent-hover);
+    color: #fff;
+    box-shadow:
+      0 2px 8px color-mix(in srgb, var(--accent) 42%, transparent),
+      inset 0 1px 0 color-mix(in srgb, #fff 22%, transparent);
+  }
+}
+.inline-switcher__account-upgrade:active {
+  transform: scale(0.96);
+}
+.inline-switcher__account-upgrade:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .inline-switcher__account-upgrade {
+    transition: background-color 150ms ease;
+  }
+  .inline-switcher__account-upgrade:active {
+    transform: none;
+  }
+}
+.inline-switcher__account-status.is-error {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--danger);
+}
+.inline-switcher__account-action {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 0 0 auto;
+  padding: 2px 6px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--accent-strong);
+  cursor: pointer;
+  border-radius: var(--radius);
+}
+.inline-switcher__account-action:hover {
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+.inline-switcher__account-action svg {
+  animation: spin 0.8s linear infinite;
+}
+
 /* Provider chips (BYOK mode) */
 .inline-switcher__chips {
   display: flex;
@@ -1545,6 +1743,13 @@
 .model-select-searchable__option:hover {
   background: var(--bg-subtle);
 }
+.model-select-searchable__option.is-disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.model-select-searchable__option.is-disabled:hover {
+  background: transparent;
+}
 .model-select-searchable__option.is-active {
   background: var(--accent-tint);
   color: var(--accent-strong);
@@ -1559,13 +1764,121 @@
   font-weight: 700;
   color: currentColor;
 }
+.model-select-searchable__value,
+.model-select-searchable__option-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  width: 100%;
+}
+.model-select-searchable__option-content {
+  align-items: flex-start;
+  gap: 10px;
+}
+.model-select-searchable__option-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.model-select-searchable__value-label,
 .model-select-searchable__option-label {
+  display: inline-flex;
+  align-items: center;
   font-size: 12.5px;
   line-height: 1.35;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-select-searchable__value-badge,
+.model-select-searchable__option-badge {
+  --model-tag-color: var(--text-muted);
+  --model-tag-bg: color-mix(in srgb, var(--model-tag-color) 10%, var(--bg-panel));
+  --model-tag-border: color-mix(in srgb, var(--model-tag-color) 34%, transparent);
+
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 112px;
+  min-height: 17px;
+  padding: 2px 6px 2px 5px;
+  border: 1px solid var(--model-tag-border);
+  border-radius: 6px;
+  background: var(--model-tag-bg);
+  color: var(--model-tag-color);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--bg-panel) 72%, white 28%);
+  font-size: 10.5px;
+  font-weight: 680;
+  line-height: 1.05;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-select-searchable__value-badge::before,
+.model-select-searchable__option-badge::before {
+  content: '';
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.88;
+  flex: 0 0 auto;
 }
 .model-select-searchable__option-meta {
   font-size: 11px;
+  line-height: 1.3;
   color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.model-select-searchable__option-badge {
+  margin-top: 1px;
+}
+.model-select-searchable__option.is-active .model-select-searchable__option-meta {
+  color: color-mix(in srgb, var(--accent-strong) 60%, var(--text-muted));
+}
+.model-select-searchable__option-lock-inline {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  vertical-align: middle;
+  margin-left: 6px;
+  transition:
+    color 160ms cubic-bezier(0.23, 1, 0.32, 1),
+    background 160ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+.model-select-searchable__option-lock-inline:hover,
+.model-select-searchable__option-lock-inline:focus-visible {
+  color: var(--accent-strong);
+  background: var(--accent-tint);
+}
+.model-select-searchable__value-badge[data-tag='standard'],
+.model-select-searchable__option-badge[data-tag='standard'] {
+  --model-tag-color: #90887a;
+}
+.model-select-searchable__value-badge[data-tag='advanced'],
+.model-select-searchable__option-badge[data-tag='advanced'] {
+  --model-tag-color: #bf8a34;
+}
+.model-select-searchable__value-badge[data-tag='bestQuality'],
+.model-select-searchable__option-badge[data-tag='bestQuality'] {
+  --model-tag-color: #c77858;
 }
 .model-select-searchable__empty {
   padding: 12px 10px;
@@ -1588,6 +1901,9 @@
   color: var(--text);
   text-align: left;
   cursor: pointer;
+}
+.inline-switcher__select .model-select-searchable__value {
+  justify-content: space-between;
 }
 .inline-switcher__select:focus-visible {
   outline: 2px solid var(--accent);
@@ -1700,16 +2016,13 @@
   gap: 8px;
 }
 
-/* Brand mark above the title. Uses the monochrome brand glyph masked with
-   --text-strong so it reads as black in light mode and white in dark mode. */
+/* Brand mark above the title; the glyph itself comes from the shared
+   .od-brand-glyph primitive. */
 .onboarding-cloud__logo {
   display: block;
   width: 52px;
   height: 52px;
   margin-bottom: 22px;
-  background-color: var(--text-strong);
-  -webkit-mask: url(/brand-icon.svg) center / contain no-repeat;
-  mask: url(/brand-icon.svg) center / contain no-repeat;
 }
 
 /* Compact, icon-only language switcher used in the cloud landing top bar —
@@ -3193,6 +3506,36 @@
   color: var(--accent-strong);
 }
 
+/* Free-text detail revealed when the visitor picks "Other" on the "Where did
+   you hear about us?" question. Rendered inline as the last item of the chip
+   row so it sits right after the Other chip (growing to fill the rest of the
+   row, or wrapping onto the next line at a comfortable width) instead of
+   floating below the group. Height matches the chips so the row stays even. */
+.onboarding-chip-field__other-input {
+  flex: 1 1 200px;
+  min-width: 180px;
+  max-width: 280px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-panel);
+  color: var(--text-strong);
+  font-size: 13px;
+  transition:
+    border-color 160ms cubic-bezier(0.23, 1, 0.32, 1),
+    box-shadow 160ms cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.onboarding-chip-field__other-input::placeholder {
+  color: var(--text-muted);
+}
+
+.onboarding-chip-field__other-input:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-tint);
+}
+
 /* Step 2 memory callout — makes it explicit that the answers above are saved
    to Memory, and sells the compounding benefit of letting it learn. */
 .onboarding-view__memory-callout {
@@ -3372,6 +3715,78 @@
   color: var(--text-muted);
   transition: transform 160ms cubic-bezier(0.23, 1, 0.32, 1), color 160ms cubic-bezier(0.23, 1, 0.32, 1);
 }
+.onboarding-view__select-trigger-value,
+.onboarding-view__select-option-content {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.onboarding-view__select-option-content {
+  align-items: flex-start;
+  gap: 10px;
+}
+.onboarding-view__select-trigger-value {
+  flex: 1 1 auto;
+}
+.onboarding-view__select-option-copy {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.onboarding-view__select-option-meta {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-muted);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.onboarding-view__select-badge {
+  --model-tag-color: var(--text-muted);
+  --model-tag-bg: color-mix(in srgb, var(--model-tag-color) 10%, var(--bg-panel));
+  --model-tag-border: color-mix(in srgb, var(--model-tag-color) 34%, transparent);
+
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 112px;
+  min-height: 17px;
+  padding: 2px 6px 2px 5px;
+  border: 1px solid var(--model-tag-border);
+  border-radius: 6px;
+  background: var(--model-tag-bg);
+  color: var(--model-tag-color);
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--bg-panel) 72%, white 28%);
+  font-size: 10.5px;
+  font-weight: 680;
+  line-height: 1.05;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.onboarding-view__select-badge::before {
+  content: '';
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.88;
+  flex: 0 0 auto;
+}
+.onboarding-view__select-badge[data-tag='standard'] {
+  --model-tag-color: #90887a;
+}
+.onboarding-view__select-badge[data-tag='advanced'] {
+  --model-tag-color: #bf8a34;
+}
+.onboarding-view__select-badge[data-tag='bestQuality'] {
+  --model-tag-color: #c77858;
+}
 
 .onboarding-view__select-trigger.has-value {
   color: var(--text-strong);
@@ -3513,7 +3928,9 @@
   cursor: pointer;
 }
 
-.onboarding-view__select-option span {
+.onboarding-view__select-option-content,
+.onboarding-view__select-option-copy span:first-child,
+.onboarding-view__select-trigger-value span:first-child {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;

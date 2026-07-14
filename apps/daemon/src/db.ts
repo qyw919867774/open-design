@@ -9,6 +9,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import type { ProjectBrowserWorkspaceTab, ProjectTabsState } from '@open-design/contracts';
+import { eventsEndedWithUnfinishedWork } from '@open-design/contracts';
 import { migrateCritique } from './critique/persistence.js';
 import { migrateMediaTasks } from './media/tasks.js';
 import { migrateLibrary } from './library-store.js';
@@ -17,7 +18,7 @@ import { migratePlugins } from './plugins/persistence.js';
 type SqliteDb = Database.Database;
 type DbRow = Record<string, any>;
 type JsonObject = Record<string, unknown>;
-type ChatSessionMode = 'design' | 'chat';
+type ChatSessionMode = 'design' | 'chat' | 'plan';
 
 let dbInstance: SqliteDb | null = null;
 let dbFile: string | null = null;
@@ -114,9 +115,11 @@ function migrate(db: SqliteDb): void {
       content TEXT NOT NULL,
       agent_id TEXT,
       agent_name TEXT,
+      result_delivery_state TEXT,
       events_json TEXT,
       attachments_json TEXT,
       produced_files_json TEXT,
+      trace_object_files_json TEXT,
       feedback_json TEXT,
       pre_turn_file_names_json TEXT,
       session_mode TEXT,
@@ -276,6 +279,9 @@ function migrate(db: SqliteDb): void {
   if (!messageCols.some((c: DbRow) => c.name === 'run_status')) {
     db.exec(`ALTER TABLE messages ADD COLUMN run_status TEXT`);
   }
+  if (!messageCols.some((c: DbRow) => c.name === 'result_delivery_state')) {
+    db.exec(`ALTER TABLE messages ADD COLUMN result_delivery_state TEXT`);
+  }
   if (!messageCols.some((c: DbRow) => c.name === 'last_run_event_id')) {
     db.exec(`ALTER TABLE messages ADD COLUMN last_run_event_id TEXT`);
   }
@@ -287,6 +293,9 @@ function migrate(db: SqliteDb): void {
   }
   if (!messageCols.some((c: DbRow) => c.name === 'pre_turn_file_names_json')) {
     db.exec(`ALTER TABLE messages ADD COLUMN pre_turn_file_names_json TEXT`);
+  }
+  if (!messageCols.some((c: DbRow) => c.name === 'trace_object_files_json')) {
+    db.exec(`ALTER TABLE messages ADD COLUMN trace_object_files_json TEXT`);
   }
   if (!messageCols.some((c: DbRow) => c.name === 'session_mode')) {
     db.exec(`ALTER TABLE messages ADD COLUMN session_mode TEXT`);
@@ -610,6 +619,7 @@ export function listLatestProjectRunStatuses(db: SqliteDb) {
       `SELECT c.project_id AS projectId,
               m.run_id AS runId,
               m.run_status AS status,
+              m.events_json AS eventsJson,
               COALESCE(m.ended_at, m.started_at, m.created_at) AS updatedAt
          FROM messages m
          JOIN conversations c ON c.id = m.conversation_id
@@ -621,13 +631,105 @@ export function listLatestProjectRunStatuses(db: SqliteDb) {
   for (const row of rows) {
     if (!latestByProject.has(row.projectId)) {
       latestByProject.set(row.projectId, {
-        value: normalizeProjectRunStatus(row.status),
+        value: projectDisplayStatusForRunRow(row.status, row.eventsJson),
         updatedAt: Number(row.updatedAt),
         runId: row.runId ?? undefined,
       });
     }
   }
   return latestByProject;
+}
+
+// A terminal `succeeded` run whose PERSISTED events show unfinished declared
+// work (a non-`completed` TodoWrite task) projects as `incomplete`, never
+// `succeeded`, so the project pill can't read "Completed" for a run whose work
+// is not actually done (#1247 / #1060). Derived from the same events the chat
+// footer reads, so the two surfaces cannot disagree, and it survives reload
+// because the events were persisted per-event as the run streamed.
+function projectDisplayStatusForRunRow(status: unknown, eventsJson: unknown) {
+  const normalized = normalizeProjectRunStatus(status);
+  if (normalized !== 'succeeded') return normalized;
+  const events = parseJsonOrUndef(eventsJson);
+  return eventsEndedWithUnfinishedWork(events) ? 'incomplete' : normalized;
+}
+
+export function listLatestConversationRunStatuses(db: SqliteDb) {
+  const rows = db
+    .prepare(
+      `SELECT m.conversation_id AS conversationId,
+              m.run_id AS runId,
+              m.run_status AS status,
+              COALESCE(m.ended_at, m.started_at, m.created_at) AS updatedAt,
+              m.position AS position
+         FROM messages m
+        WHERE m.run_status IS NOT NULL
+        ORDER BY updatedAt DESC, m.position DESC`,
+    )
+    .all() as DbRow[];
+  const latestByConversation = new Map<string, DbRow>();
+  for (const row of rows) {
+    if (!latestByConversation.has(row.conversationId)) {
+      latestByConversation.set(row.conversationId, {
+        value: normalizeProjectRunStatus(row.status),
+        updatedAt: Number(row.updatedAt),
+        runId: row.runId ?? undefined,
+      });
+    }
+  }
+  return latestByConversation;
+}
+
+export function listFirstConversationRunStatuses(db: SqliteDb) {
+  const rows = db
+    .prepare(
+      `SELECT m.conversation_id AS conversationId,
+              m.run_id AS runId,
+              m.run_status AS status,
+              COALESCE(m.ended_at, m.started_at, m.created_at) AS updatedAt,
+              m.position AS position
+         FROM messages m
+        WHERE m.run_status IS NOT NULL
+          AND m.run_id IS NOT NULL
+        ORDER BY m.position ASC`,
+    )
+    .all() as DbRow[];
+  const firstByConversation = new Map<string, DbRow>();
+  for (const row of rows) {
+    if (!firstByConversation.has(row.conversationId)) {
+      firstByConversation.set(row.conversationId, {
+        value: normalizeProjectRunStatus(row.status),
+        updatedAt: Number(row.updatedAt),
+        runId: row.runId ?? undefined,
+      });
+    }
+  }
+  return firstByConversation;
+}
+
+export function listLatestRunStatuses(db: SqliteDb) {
+  const rows = db
+    .prepare(
+      `SELECT m.run_id AS runId,
+              m.run_status AS status,
+              COALESCE(m.ended_at, m.started_at, m.created_at) AS updatedAt,
+              m.position AS position
+         FROM messages m
+        WHERE m.run_status IS NOT NULL
+          AND m.run_id IS NOT NULL
+        ORDER BY updatedAt DESC, m.position DESC`,
+    )
+    .all() as DbRow[];
+  const latestByRun = new Map<string, DbRow>();
+  for (const row of rows) {
+    if (!latestByRun.has(row.runId)) {
+      latestByRun.set(row.runId, {
+        value: normalizeProjectRunStatus(row.status),
+        updatedAt: Number(row.updatedAt),
+        runId: row.runId ?? undefined,
+      });
+    }
+  }
+  return latestByRun;
 }
 
 export function listProjectsAwaitingInput(db: SqliteDb) {
@@ -668,6 +770,41 @@ export function listProjectsAwaitingInput(db: SqliteDb) {
     )
     .all() as DbRow[];
   return new Set((rows as DbRow[]).map((row: DbRow) => row.projectId));
+}
+
+export function listConversationsAwaitingInput(db: SqliteDb) {
+  const rows = db
+    .prepare(
+      `SELECT latest.conversationId
+         FROM (
+           SELECT m.conversation_id AS conversationId,
+                  m.created_at AS createdAt,
+                  m.position AS position,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY m.conversation_id
+                    ORDER BY m.created_at DESC, m.position DESC
+                  ) AS rowNum
+             FROM messages m
+            WHERE m.role = 'assistant'
+              AND (
+                LOWER(m.content) LIKE '%<question-form%'
+                OR LOWER(m.content) LIKE '%<ask-question%'
+              )
+         ) latest
+        WHERE latest.rowNum = 1
+          AND NOT EXISTS (
+            SELECT 1
+              FROM messages reply
+             WHERE reply.conversation_id = latest.conversationId
+               AND reply.role = 'user'
+               AND (
+                 reply.created_at > latest.createdAt
+                 OR (reply.created_at = latest.createdAt AND reply.position > latest.position)
+               )
+          )`,
+    )
+    .all() as DbRow[];
+  return new Set((rows as DbRow[]).map((row: DbRow) => row.conversationId));
 }
 
 export function getProject(db: SqliteDb, id: string) {
@@ -960,7 +1097,7 @@ function normalizeConversation(r: DbRow) {
 }
 
 export function normalizeConversationSessionMode(value: unknown): ChatSessionMode {
-  return value === 'chat' ? 'chat' : 'design';
+  return value === 'chat' || value === 'plan' ? value : 'design';
 }
 
 function numberProperty(key: string, value: unknown) {
@@ -1257,11 +1394,13 @@ export function listMessages(db: SqliteDb, conversationId: string) {
     .prepare(
       `SELECT id, role, content, agent_id AS agentId, agent_name AS agentName,
               run_id AS runId, run_status AS runStatus,
+              result_delivery_state AS resultDeliveryState,
               last_run_event_id AS lastRunEventId,
               events_json AS eventsJson,
               attachments_json AS attachmentsJson,
               comment_attachments_json AS commentAttachmentsJson,
               produced_files_json AS producedFilesJson,
+              trace_object_files_json AS traceObjectFilesJson,
               feedback_json AS feedbackJson,
               pre_turn_file_names_json AS preTurnFileNamesJson,
               session_mode AS sessionMode,
@@ -1286,9 +1425,9 @@ export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
     db.prepare(
       `UPDATE messages
           SET role = ?, content = ?, agent_id = ?, agent_name = ?,
-              run_id = ?, run_status = ?, last_run_event_id = ?,
+              run_id = ?, run_status = ?, result_delivery_state = ?, last_run_event_id = ?,
               events_json = ?, attachments_json = ?, comment_attachments_json = ?,
-              produced_files_json = ?, feedback_json = ?,
+              produced_files_json = ?, trace_object_files_json = ?, feedback_json = ?,
               pre_turn_file_names_json = ?,
               session_mode = ?, run_context_json = ?, applied_plugin_snapshot_json = ?,
               telemetry_finalized_at = CASE
@@ -1304,11 +1443,13 @@ export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
       m.agentName ?? null,
       m.runId ?? null,
       m.runStatus ?? null,
+      normalizeResultDeliveryStateForStorage(m.resultDeliveryState),
       m.lastRunEventId ?? null,
       m.events ? JSON.stringify(m.events) : null,
       m.attachments ? JSON.stringify(m.attachments) : null,
       m.commentAttachments ? JSON.stringify(m.commentAttachments) : null,
       m.producedFiles ? JSON.stringify(m.producedFiles) : null,
+      m.traceObjectFiles ? JSON.stringify(m.traceObjectFiles) : null,
       m.feedback ? JSON.stringify(m.feedback) : null,
       m.preTurnFileNames ? JSON.stringify(m.preTurnFileNames) : null,
       normalizeMessageSessionModeForStorage(m.sessionMode),
@@ -1330,21 +1471,21 @@ export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
     const createdAt = typeof m.createdAt === 'number' && Number.isFinite(m.createdAt)
       ? m.createdAt
       : now;
-    // 23 values: id, conversation_id, role, content, agent_id, agent_name,
-    // run_id, run_status, last_run_event_id, events_json, attachments_json,
-    // comment_attachments_json, produced_files_json, feedback_json,
-    // pre_turn_file_names_json, session_mode, run_context_json,
+    // 25 values: id, conversation_id, role, content, agent_id, agent_name,
+    // run_id, run_status, result_delivery_state, last_run_event_id, events_json, attachments_json,
+    // comment_attachments_json, produced_files_json, trace_object_files_json,
+    // feedback_json, pre_turn_file_names_json, session_mode, run_context_json,
     // applied_plugin_snapshot_json, telemetry_finalized_at, started_at,
     // ended_at, position, created_at.
     db.prepare(
       `INSERT INTO messages
          (id, conversation_id, role, content, agent_id, agent_name,
-          run_id, run_status, last_run_event_id, events_json,
+          run_id, run_status, result_delivery_state, last_run_event_id, events_json,
           attachments_json, comment_attachments_json, produced_files_json,
-          feedback_json, pre_turn_file_names_json,
+          trace_object_files_json, feedback_json, pre_turn_file_names_json,
           session_mode, run_context_json, applied_plugin_snapshot_json,
           telemetry_finalized_at, started_at, ended_at, position, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ).run(
       m.id,
       conversationId,
@@ -1354,11 +1495,13 @@ export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
       m.agentName ?? null,
       m.runId ?? null,
       m.runStatus ?? null,
+      normalizeResultDeliveryStateForStorage(m.resultDeliveryState),
       m.lastRunEventId ?? null,
       m.events ? JSON.stringify(m.events) : null,
       m.attachments ? JSON.stringify(m.attachments) : null,
       m.commentAttachments ? JSON.stringify(m.commentAttachments) : null,
       m.producedFiles ? JSON.stringify(m.producedFiles) : null,
+      m.traceObjectFiles ? JSON.stringify(m.traceObjectFiles) : null,
       m.feedback ? JSON.stringify(m.feedback) : null,
       m.preTurnFileNames ? JSON.stringify(m.preTurnFileNames) : null,
       normalizeMessageSessionModeForStorage(m.sessionMode),
@@ -1380,11 +1523,13 @@ export function upsertMessage(db: SqliteDb, conversationId: string, m: DbRow) {
     .prepare(
       `SELECT id, role, content, agent_id AS agentId, agent_name AS agentName,
               run_id AS runId, run_status AS runStatus,
+              result_delivery_state AS resultDeliveryState,
               last_run_event_id AS lastRunEventId,
               events_json AS eventsJson,
               attachments_json AS attachmentsJson,
               comment_attachments_json AS commentAttachmentsJson,
               produced_files_json AS producedFilesJson,
+              trace_object_files_json AS traceObjectFilesJson,
               feedback_json AS feedbackJson,
               pre_turn_file_names_json AS preTurnFileNamesJson,
               session_mode AS sessionMode,
@@ -1758,11 +1903,13 @@ function normalizeMessage(row: DbRow) {
     agentName: row.agentName ?? undefined,
     runId: row.runId ?? undefined,
     runStatus: row.runStatus ?? undefined,
+    resultDeliveryState: normalizeResultDeliveryState(row.resultDeliveryState),
     lastRunEventId: row.lastRunEventId ?? undefined,
     events: parseJsonOrUndef(row.eventsJson),
     attachments: parseJsonOrUndef(row.attachmentsJson),
     commentAttachments: parseJsonOrUndef(row.commentAttachmentsJson),
     producedFiles: parseJsonOrUndef(row.producedFilesJson),
+    traceObjectFiles: parseJsonOrUndef(row.traceObjectFilesJson),
     feedback: parseJsonOrUndef(row.feedbackJson),
     preTurnFileNames: parseJsonOrUndef(row.preTurnFileNamesJson),
     sessionMode: normalizeMessageSessionMode(row.sessionMode),
@@ -1775,11 +1922,25 @@ function normalizeMessage(row: DbRow) {
 }
 
 function normalizeMessageSessionMode(value: unknown): ChatSessionMode | undefined {
-  return value === 'chat' || value === 'design' ? value : undefined;
+  return value === 'chat' || value === 'design' || value === 'plan' ? value : undefined;
+}
+
+function normalizeResultDeliveryState(
+  value: unknown,
+): 'delivered' | 'no_result' | 'delivery_failed' | undefined {
+  return value === 'delivered' || value === 'no_result' || value === 'delivery_failed'
+    ? value
+    : undefined;
+}
+
+function normalizeResultDeliveryStateForStorage(
+  value: unknown,
+): 'delivered' | 'no_result' | 'delivery_failed' | null {
+  return normalizeResultDeliveryState(value) ?? null;
 }
 
 function normalizeMessageSessionModeForStorage(value: unknown): ChatSessionMode | null {
-  return value === 'chat' || value === 'design' ? value : null;
+  return value === 'chat' || value === 'design' || value === 'plan' ? value : null;
 }
 
 function parseJsonOrUndef(s: unknown): any {

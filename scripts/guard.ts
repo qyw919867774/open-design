@@ -4,11 +4,13 @@ import { pathToFileURL } from "node:url";
 import ts from "typescript";
 
 import { checkCrossAppImports } from "./check-cross-app-imports.ts";
+import { checkTsNocheckImports } from "./check-ts-nocheck-imports.ts";
 import { checkDesignSystemManifests } from "./check-design-system-manifests.ts";
 import { checkDesignSystemPackageQuality } from "./check-design-system-package-quality.ts";
 import { checkDesignSystemComponentFixtureReport } from "./check-components-fixtures.ts";
 import { checkDesignSystemFlagParity } from "./check-design-system-flag-parity.ts";
 import { checkComponentsManifestExtraction } from "./check-components-manifest-extraction.ts";
+import { checkPluginPreviewManifest } from "./check-plugin-preview-manifest.ts";
 import { validatePlaywrightSuiteTopology } from "../e2e/lib/playwright/suites.ts";
 import {
   checkDesignSystemA1RequiredTokens,
@@ -82,6 +84,10 @@ const residualAllowedExactPaths = new Set([
   "apps/packaged/esbuild.config.mjs",
   // Browser service workers must be served as JavaScript files.
   "apps/web/public/od-notifications-sw.js",
+  // Vendored dom-to-pptx browser bundle used by the packaged desktop renderer
+  // for editable PPTX export. It is loaded into the off-screen Chromium page as
+  // an upstream browser asset, not compiled as project-owned TypeScript.
+  "apps/desktop/vendor/dom-to-pptx/dom-to-pptx.bundle.js",
   // Shared nav enhancer for the landing-page static `/community/` pages,
   // which are verbatim HTML served straight from `public/` (not Astro-
   // compiled). It must ship as a browser-loadable `.js` asset, same as the
@@ -142,10 +148,18 @@ const residualAllowedPathPrefixes = [
   "e2e/ui/test-results/",
   // Vendored upstream HyperFrames helper scripts (design template).
   "design-templates/hyperframes/scripts/",
+  // Vendored upstream Web Clone skill helper scripts. These are portable
+  // Node-run skill utilities executed from user workspaces via explicit script
+  // paths, and stay as `.mjs` to preserve the upstream skill packaging.
+  "skills/web-clone/scripts/",
   // Vendored upstream Last30Days runtime helper used by the engine (design template).
   "design-templates/last30days/scripts/lib/vendor/",
   // Vendored upstream html-ppt runtime assets (lewislulu/html-ppt-skill, design template).
   "design-templates/html-ppt/assets/",
+  // Vendored upstream website-clone recon/mirror/audit helpers
+  // (Jane-xiaoer/claude-skill-web-clone). Global skill assets staged into the
+  // project cwd for direct `node scripts/...` execution by the agent.
+  "skills/web-clone/scripts/",
   // Replay-based mock CLIs that impersonate the agent CLIs OD spawns
   // (opencode/claude/codex/gemini/cursor-agent + ACP family). Need to
   // be directly executable via Node so `child_process.spawn` from test
@@ -1290,6 +1304,7 @@ const checks: GuardCheck[] = [
   { name: "package dependency specs", run: checkPackageDependencySpecs },
   { name: "product neutrality", run: checkProductNeutrality },
   { name: "cross-app imports", run: checkCrossAppImports },
+  { name: "@ts-nocheck import resolution", run: checkTsNocheckImports },
   { name: "test layout", run: checkTestLayout },
   { name: "e2e layout", run: checkE2eLayout },
   { name: "web test layout", run: checkWebTestLayout },
@@ -1298,6 +1313,7 @@ const checks: GuardCheck[] = [
   { name: "style policy", run: checkStylePolicy },
   { name: "CI topology", run: checkCiTopology },
   { name: "craft references", run: checkCraftReferences },
+  { name: "plugin preview manifest", run: checkPluginPreviewManifest },
   { name: "design system manifests", run: checkDesignSystemManifests },
   { name: "design system package quality", run: checkDesignSystemPackageQuality },
   { name: "design system component fixture report", run: checkDesignSystemComponentFixtureReport },

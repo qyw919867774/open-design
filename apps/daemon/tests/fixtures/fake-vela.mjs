@@ -3,7 +3,7 @@
  * Fake vela CLI used by AMR integration tests. Routes by the first argv:
  *
  *   `vela model preset --format json`   → prints the local AMR picker seed.
- *   `vela model list --format json`     → prints the authoritative remote
+ *   `vela model list --all --format json` → prints the authoritative remote
  *                                         AMR model catalog.
  *
  *   `vela login`                        → writes ~/.amr/config.json (the
@@ -44,10 +44,12 @@
  *   FAKE_VELA_PROMPT_ERROR       – when set, session/prompt returns a JSON-RPC error
  *   FAKE_VELA_MODELS             – newline-separated `vela models` stdout
  *   FAKE_VELA_MODEL_PRESET_JSON  – JSON stdout for `model preset --format json`
- *   FAKE_VELA_MODEL_LIST_JSON    – JSON stdout for `model list --format json`
+ *   FAKE_VELA_MODEL_LIST_JSON    – JSON stdout for `model list --all --format json`
  *   FAKE_VELA_REQUIRE_SET_MODEL  – strict gate (default on); set to '0' to
  *                                   accept session/prompt without prior
  *                                   session/set_model (legacy behaviour)
+ *   FAKE_VELA_LOG_SET_MODEL      – when set to '1', include session/set_model
+ *                                   entries in FAKE_VELA_INVOCATION_LOG
  */
 
 import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';
@@ -246,6 +248,9 @@ function handleMessage(msg) {
       const next = typeof params?.modelId === 'string' ? params.modelId.trim() : '';
       const sessionId = typeof params?.sessionId === 'string' ? params.sessionId : SESSION_ID;
       if (next) currentModelId = next;
+      if (env.FAKE_VELA_LOG_SET_MODEL === '1') {
+        logInvocation(`set_model:${next || '<empty>'}`);
+      }
       sessionsWithModel.add(sessionId);
       writeResult(id, {});
       return;
@@ -433,7 +438,46 @@ if (argv[2] === 'models') {
   exit(0);
 }
 
-if (argv[2] === 'model' && argv[4] === '--format' && argv[5] === 'json') {
+// `vela billing summary --format json` → live account projection.
+//   FAKE_VELA_BILLING_TIER         – membershipTier (plan) in the JSON
+//   FAKE_VELA_BILLING_BALANCE_USD  – balanceUsd in the JSON
+// With neither set, behave as if billing is unavailable (exit 1) so the
+// route's cold-cache fallback keeps returning config-only as before.
+if (argv[2] === 'billing' && argv[3] === 'summary') {
+  if (env.FAKE_VELA_BILLING_LOG) {
+    appendFileSync(
+      env.FAKE_VELA_BILLING_LOG,
+      `${Date.now()}\t${env.VELA_RUNTIME_KEY || ''}\n`,
+    );
+  }
+  if (env.FAKE_VELA_BILLING_UNKNOWN_COMMAND) {
+    stderr.write('Error: unknown command "billing" for "vela"\n');
+    exit(1);
+  }
+  const delayMs = Number(env.FAKE_VELA_BILLING_DELAY_MS) || 0;
+  const finishBilling = () => {
+    const tier = env.FAKE_VELA_BILLING_TIER;
+    const balance = env.FAKE_VELA_BILLING_BALANCE_USD;
+    if (!tier && !balance) {
+      stderr.write('billing summary unavailable\n');
+      exit(1);
+    }
+    stdout.write(
+      `${JSON.stringify({
+        ...(tier ? { membershipTier: tier } : {}),
+        balanceUsd: balance ?? null,
+      })}\n`,
+    );
+    exit(0);
+  };
+  if (delayMs > 0) {
+    setTimeout(finishBilling, delayMs);
+  } else {
+    finishBilling();
+  }
+}
+
+if (argv[2] === 'model' && argv.includes('--format') && argv.includes('json')) {
   if (argv[3] === 'preset') {
     stdout.write(`${env.FAKE_VELA_MODEL_PRESET_JSON || DEFAULT_MODEL_PRESET_JSON}\n`);
     exit(0);

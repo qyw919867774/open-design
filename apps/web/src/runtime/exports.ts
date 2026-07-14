@@ -20,6 +20,10 @@ import {
   printHostPdf,
 } from '@open-design/host';
 
+// Re-exported so app components can gate desktop-only export paths without
+// importing the host package directly.
+export { isOpenDesignHostAvailable } from '@open-design/host';
+
 const DESIGN_HANDOFF_FILENAME = 'DESIGN-HANDOFF.md';
 const DESIGN_MANIFEST_FILENAME = 'DESIGN-MANIFEST.json';
 
@@ -38,6 +42,23 @@ function triggerHrefDownload(href: string, filename: string): void {
   document.body.appendChild(a);
   a.click();
   document.body.removeChild(a);
+}
+
+// Pulls the attachment filename out of a Content-Disposition header,
+// preferring the RFC 5987 UTF-8 form. Returns null when absent so callers
+// can fall back to a locally derived name.
+function filenameFromContentDisposition(resp: Response): string | null {
+  const header = resp.headers.get('content-disposition') || '';
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (star && star[1]) {
+    try {
+      return decodeURIComponent(star[1]);
+    } catch {
+      // fall through
+    }
+  }
+  const plain = /filename="([^"]+)"/i.exec(header);
+  return plain && plain[1] ? plain[1] : null;
 }
 
 function triggerDownload(blob: Blob, filename: string): void {
@@ -59,13 +80,16 @@ export async function exportProjectAsHtml(opts: {
   filePath: string;
   fallbackHtml: string;
   fallbackTitle: string;
+  versionId?: string;
 }): Promise<void> {
   const segments = opts.filePath
     .split('/')
     .filter(Boolean)
     .map((segment) => encodeURIComponent(segment))
     .join('/');
-  const url = `/api/projects/${encodeURIComponent(opts.projectId)}/export/${segments}?inline=1`;
+  const query = new URLSearchParams({ inline: '1' });
+  if (opts.versionId) query.set('versionId', opts.versionId);
+  const url = `/api/projects/${encodeURIComponent(opts.projectId)}/export/${segments}?${query.toString()}`;
   try {
     const resp = await fetch(url);
     if (!resp.ok) throw new Error(`html export request failed (${resp.status})`);
@@ -359,6 +383,8 @@ export function exportAsMd(source: string, title: string): void {
  */
 export type PreviewSnapshot = { dataUrl: string; w: number; h: number };
 
+export type PreviewSnapshotOptions = { full?: boolean };
+
 export type PreviewSnapshotResult =
   | { ok: true; snapshot: PreviewSnapshot }
   | { ok: false; reason: 'loading' | 'post-message-error' | 'render-error' | 'timeout'; error?: string };
@@ -366,6 +392,7 @@ export type PreviewSnapshotResult =
 export function requestPreviewSnapshotResult(
   iframe: HTMLIFrameElement,
   timeout = 8000,
+  options: PreviewSnapshotOptions = {},
 ): Promise<PreviewSnapshotResult> {
   const win = iframe.contentWindow;
   if (!win) return Promise.resolve({ ok: false, reason: 'loading' });
@@ -391,7 +418,7 @@ export function requestPreviewSnapshotResult(
     }
     window.addEventListener('message', onMsg);
     try {
-      win.postMessage({ type: 'od:snapshot', id }, '*');
+      win.postMessage({ type: 'od:snapshot', id, ...(options.full ? { full: true } : {}) }, '*');
     } catch {
       done = true;
       window.removeEventListener('message', onMsg);
@@ -410,8 +437,9 @@ export function requestPreviewSnapshotResult(
 export async function requestPreviewSnapshot(
   iframe: HTMLIFrameElement,
   timeout = 8000,
+  options: PreviewSnapshotOptions = {},
 ): Promise<PreviewSnapshot | null> {
-  const result = await requestPreviewSnapshotResult(iframe, timeout);
+  const result = await requestPreviewSnapshotResult(iframe, timeout, options);
   return result.ok ? result.snapshot : null;
 }
 
@@ -733,6 +761,7 @@ export async function exportProjectAsPdf(opts: {
   filePath: string;
   projectId: string;
   title: string;
+  versionId?: string;
 }): Promise<ProjectPdfExportResult> {
   try {
     const resp = await fetch(`/api/projects/${encodeURIComponent(opts.projectId)}/export/pdf`, {
@@ -740,6 +769,7 @@ export async function exportProjectAsPdf(opts: {
         deck: opts.deck,
         fileName: opts.filePath,
         title: opts.title,
+        ...(opts.versionId ? { versionId: opts.versionId } : {}),
       }),
       headers: { 'content-type': 'application/json' },
       method: 'POST',
@@ -817,7 +847,26 @@ export async function exportProjectAsZip(opts: {
   filePath: string;
   fallbackHtml: string;
   fallbackTitle: string;
+  versionId?: string;
 }): Promise<void> {
+  if (opts.versionId) {
+    const segments = opts.filePath
+      .split('/')
+      .filter(Boolean)
+      .map((segment) => encodeURIComponent(segment))
+      .join('/');
+    const query = new URLSearchParams({ inline: '1', versionId: opts.versionId });
+    try {
+      const resp = await fetch(`/api/projects/${encodeURIComponent(opts.projectId)}/export/${segments}?${query.toString()}`);
+      if (!resp.ok) throw new Error(`version html export request failed (${resp.status})`);
+      exportAsZip(await resp.text(), opts.fallbackTitle);
+      return;
+    } catch (err) {
+      console.warn('[exportProjectAsZip] falling back to single-file ZIP:', err);
+      exportAsZip(opts.fallbackHtml, opts.fallbackTitle);
+      return;
+    }
+  }
   const root = archiveRootFromFilePath(opts.filePath);
   const url = `/api/projects/${encodeURIComponent(opts.projectId)}/archive${
     root ? `?root=${encodeURIComponent(root)}` : ''
@@ -831,6 +880,230 @@ export async function exportProjectAsZip(opts: {
     console.warn('[exportProjectAsZip] falling back to single-file ZIP:', err);
     exportAsZip(opts.fallbackHtml, opts.fallbackTitle);
   }
+}
+
+// Tri-state, mirroring exportProjectImageDataUrl: callers must distinguish a
+// genuinely-unavailable off-screen renderer (no desktop host / 501 / transport
+// failure) — where falling back to the vector/browser PDF is correct — from a
+// SEMANTIC export failure (bad deck routing, unreadable renderer output, a
+// renderer-side 502, "page too tall", …), which must be surfaced rather than
+// silently masked by the old vector path (which can reintroduce the CJK-glyph /
+// fidelity bugs this screenshot path exists to avoid).
+export type ProjectScreenshotExportResult =
+  | { ok: true }
+  | { ok: false; unavailable: true }
+  | { ok: false; error: string };
+
+// Programmatic screenshot-based PPTX export. POSTs to the daemon, which renders
+// each deck slide to a pixel-perfect PNG (via the desktop's Electron Chromium)
+// and assembles a one-image-per-slide .pptx, then streams the bytes back for a
+// blob download. Replaces the old "send a prompt and let the agent run
+// python-pptx" path. `format: 'pdf'` produces the raster (screenshot) PDF.
+export async function exportProjectAsPptx(opts: {
+  projectId: string;
+  fileName: string;
+  title?: string;
+  format?: 'pptx' | 'pdf';
+  deck?: boolean;
+  versionId?: string;
+  // pptx only: produce an editable deck (native shapes/text) instead of a
+  // screenshot one (one image per slide).
+  editable?: boolean;
+}): Promise<ProjectScreenshotExportResult> {
+  const format = opts.format ?? 'pptx';
+  const path = format === 'pdf' ? 'export/pdf-image' : 'export/pptx';
+  const url = `/api/projects/${encodeURIComponent(opts.projectId)}/${path}`;
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        fileName: opts.fileName,
+        ...(opts.title ? { title: opts.title } : {}),
+        ...(opts.versionId ? { versionId: opts.versionId } : {}),
+        ...(format === 'pptx'
+          ? { deck: true, ...(opts.editable ? { editable: true } : {}) }
+          : typeof opts.deck === 'boolean'
+            ? { deck: opts.deck }
+            : {}),
+      }),
+    });
+  } catch {
+    // Transport-level failure (offline, daemon down) — genuinely unavailable, so
+    // the caller may fall back to the vector/browser PDF.
+    return { ok: false, unavailable: true };
+  }
+  if (!resp.ok) {
+    // 501 = this runtime has no off-screen renderer → caller may fall back to
+    // the vector/browser PDF. Everything else is a real (semantic) failure that
+    // must surface, not be masked by the vector path.
+    if (resp.status === 501) return { ok: false, unavailable: true };
+    let message = `export request failed (${resp.status})`;
+    try {
+      const err = await resp.json();
+      if (err?.error?.message) message = String(err.error.message);
+    } catch {
+      // non-JSON error body; keep the status-based message
+    }
+    return { ok: false, error: message };
+  }
+  // The renderer already produced bytes — a failure reading the body or
+  // triggering the download is a real (post-response) export failure, NOT
+  // "renderer unavailable". Returning `error` (not `unavailable`) keeps the
+  // caller from silently downgrading to the lower-fidelity vector path.
+  try {
+    const blob = await resp.blob();
+    const base = opts.fileName.replace(/^.*\//, '').replace(/\.html?$/i, '');
+    const slug = safeFilename(opts.title || base, 'deck');
+    const fromHeader = filenameFromContentDisposition(resp);
+    triggerDownload(blob, fromHeader || `${slug}.${format}`);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : 'export download failed' };
+  }
+}
+
+// Whether an HTML artifact carries a structured deck runtime for EXPORT
+// purposes, beyond explicit project/file metadata. Runtime-managed decks render
+// slides through a custom element (e.g. `<deck-stage>` with slotted
+// `<section data-screen-label="...">` children toggled via `data-deck-active`)
+// and can carry no literal `class="slide"`, so metadata-only checks can miss
+// them. Older html-ppt templates use `.slide` together with deck-specific
+// structure such as `data-title` or a `.deck` wrapper. Deliberately DO NOT treat
+// a plain `.slide` class as proof of a deck: ordinary pages often use that token
+// for carousels/testimonials and still need full-page/scroll-stitch capture.
+export function sourceLooksLikeExportableDeck(source: string | null | undefined): boolean {
+  if (!source) return false;
+  return (
+    /<deck-stage[\s/>]|\bdata-screen-label\s*=|class\s*=\s*['"](?:[^'"]*\s)?(?:deck-slide|ppt-slide)(?:\s|['"])/i.test(
+      source,
+    ) ||
+    /<[^>]*\bclass\s*=\s*['"](?:[^'"]*\s)?slide(?:\s|['"])[^>]*\bdata-title\s*=|<[^>]*\bdata-title\s*=[^>]*\bclass\s*=\s*['"](?:[^'"]*\s)?slide(?:\s|['"])/i.test(
+      source,
+    ) ||
+    /<[^>]*\bclass\s*=\s*['"](?:[^'"]*\s)?deck(?:\s|['"])[^>]*>\s*<[^>]*\bclass\s*=\s*['"](?:[^'"]*\s)?slide(?:\s|['"])/i.test(
+      source,
+    )
+  );
+}
+
+// Decides how a current-slide / whole-deck / page image capture should run.
+// The off-screen renderer needs a concrete slide `index` for a CURRENT-slide
+// capture (Copy screenshot / annotation), but we only know the active slide when
+// the viewer tracks it (`trackedActive`). Runtime-managed decks (`<deck-stage>` /
+// `data-screen-label`) are deliberately kept out of the viewer's nav signal, so
+// they have no active-slide bridge (`trackedActive === null`); a current-slide
+// off-screen render would then always grab slide 0, exporting slide 1 instead of
+// the slide on screen. For that case the caller must skip the off-screen path and
+// use the visible host snapshot (which IS the current slide). Whole-deck (Export
+// as image, omits index → stitches all), ordinary pages, and tracked `.slide`
+// decks still use the off-screen renderer.
+export function planDeckImageCapture(opts: {
+  deck: boolean;
+  wholeDeck: boolean;
+  trackedActive: number | null;
+}): { useOffscreen: boolean; index: number | undefined } {
+  // Export as image: the whole page / whole deck, off-screen and
+  // viewport-independent.
+  if (opts.wholeDeck) return { useOffscreen: true, index: undefined };
+  // A current-view capture (Copy screenshot / annotation) must stay
+  // viewport-based: an ordinary page uses the visible host snapshot, NOT an
+  // off-screen full-page render (which would copy the whole document instead of
+  // what the user is looking at, and break captureViewport annotations). A deck
+  // current-slide uses the off-screen renderer at the active slide ONLY when the
+  // viewer tracks it; a runtime-managed deck with no tracked active slide also
+  // falls back to the visible snapshot (we can't tell which slide it's on).
+  if (!opts.deck || opts.trackedActive === null) return { useOffscreen: false, index: undefined };
+  return { useOffscreen: true, index: opts.trackedActive };
+}
+
+// Programmatic image export: render a single pixel-perfect PNG via the daemon
+// (off-screen Electron Chromium), independent of the preview pane size. For a
+// deck pass the current slide `index` (Copy screenshot); omit it to stitch the
+// WHOLE deck top-to-bottom into one long image (Export as image) or to capture an
+// ordinary page at natural size. Returns a {dataUrl,w,h} snapshot compatible with
+// the existing image-export pipeline, or null if unavailable.
+// Discriminates a genuinely-unavailable off-screen renderer (no desktop host /
+// 501 / network) — where the caller may fall back to a visible-preview capture —
+// from a SEMANTIC export failure (e.g. "page is too tall — export as PDF"), which
+// must be surfaced rather than silently downgraded to a partial viewport shot.
+export type ProjectImageExportResult =
+  | { ok: true; snapshot: PreviewSnapshot }
+  | { ok: false; unavailable: true }
+  | { ok: false; error: string };
+
+export async function exportProjectImageDataUrl(opts: {
+  projectId: string;
+  fileName: string;
+  index?: number;
+  deck?: boolean;
+  versionId?: string;
+}): Promise<ProjectImageExportResult> {
+  const url = `/api/projects/${encodeURIComponent(opts.projectId)}/export/image`;
+  let resp: Response;
+  try {
+    resp = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        fileName: opts.fileName,
+        ...(typeof opts.index === 'number' ? { index: opts.index } : {}),
+        ...(typeof opts.deck === 'boolean' ? { deck: opts.deck } : {}),
+        ...(opts.versionId ? { versionId: opts.versionId } : {}),
+      }),
+    });
+  } catch {
+    // Transport-level failure (offline, daemon down) — genuinely unavailable, so
+    // the caller may fall back to a visible-preview capture.
+    return { ok: false, unavailable: true };
+  }
+  if (!resp.ok) {
+    // 501 = this runtime has no off-screen renderer → caller may fall back.
+    if (resp.status === 501) return { ok: false, unavailable: true };
+    let message = `image export failed (${resp.status})`;
+    try {
+      const err = await resp.json();
+      if (err?.error?.message) message = String(err.error.message);
+    } catch {
+      // non-JSON body; keep the status-based message
+    }
+    return { ok: false, error: message };
+  }
+  // A 200 with an unreadable/corrupt payload is a real export failure, NOT
+  // "renderer unavailable" — surface it instead of silently downgrading to the
+  // viewport screenshot.
+  try {
+    const blob = await resp.blob();
+    const dataUrl = await blobToDataUrl(blob);
+    const img = await loadImageFromDataUrl(dataUrl);
+    return { ok: true, snapshot: { dataUrl, w: img.naturalWidth, h: img.naturalHeight } };
+  } catch {
+    return { ok: false, error: 'image export returned an unreadable response' };
+  }
+}
+
+// Pixel-perfect screenshot PDF (one raster page per deck slide, or the whole
+// page for a website) via the same off-screen renderer as image/PPTX. Used as
+// the default UI PDF because Chromium's vector printToPDF drops CJK glyphs in
+// the packaged runtime.
+export function exportProjectScreenshotPdf(opts: {
+  projectId: string;
+  fileName: string;
+  title?: string;
+  deck?: boolean;
+  versionId?: string;
+}): Promise<ProjectScreenshotExportResult> {
+  return exportProjectAsPptx({ ...opts, format: 'pdf' });
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result));
+    reader.onerror = () => reject(reader.error ?? new Error('blob read failed'));
+    reader.readAsDataURL(blob);
+  });
 }
 
 // Design system ZIP export — asks the daemon to bundle the whole brand
@@ -1233,6 +1506,13 @@ const DECK_PRINT_CSS = `
     transform: none !important;
     position: relative !important;
     overflow: hidden !important;
+    /* Decks commonly show one slide at a time via opacity; without this the
+       inactive slides print as blank pages. Force every slide visible (and
+       freeze entrance animations) so each becomes a real page. */
+    opacity: 1 !important;
+    visibility: visible !important;
+    animation: none !important;
+    transition: none !important;
   }
   .slide:last-child, [data-screen-label]:last-child { page-break-after: auto; break-after: auto; }
   .deck-counter, .deck-hint, .deck-nav,
@@ -1381,10 +1661,12 @@ async function captureArtifactSlides(
     width?: number;
     height?: number;
     onProgress?: ExportProgress;
+    timeoutMs?: number;
   },
 ): Promise<CapturedSlide[]> {
   const width = opts.width ?? (opts.deck ? 1920 : 1440);
   const height = opts.height ?? (opts.deck ? 1080 : 900);
+  const timeoutMs = opts.timeoutMs ?? 45_000;
 
   const iframe = document.createElement('iframe');
   iframe.setAttribute('sandbox', 'allow-scripts');
@@ -1396,7 +1678,7 @@ async function captureArtifactSlides(
 
   const slides: CapturedSlide[] = [];
   try {
-    const win = await waitForIframeWindow(iframe);
+    const win = await waitForIframeWindow(iframe, Math.min(timeoutMs, 15_000));
     // Give the deck bridge time to fit fixed-canvas (transform: scale) layouts
     // to the iframe before the first capture.
     await delayMs(opts.deck ? 600 : 150);
@@ -1412,7 +1694,7 @@ async function captureArtifactSlides(
         slides.push(slide);
         opts.onProgress?.(slides.length, total);
       },
-      45_000,
+      timeoutMs,
     );
   } finally {
     iframe.remove();
@@ -1421,16 +1703,55 @@ async function captureArtifactSlides(
   return slides;
 }
 
+/** Programmatic, client-side image export for an in-memory HTML snapshot. */
+export async function exportArtifactImageDataUrl(
+  html: string,
+  opts: { deck: boolean; onProgress?: ExportProgress; timeoutMs?: number },
+): Promise<PreviewSnapshot> {
+  const slides = await captureArtifactSlides(html, {
+    deck: opts.deck,
+    mode: 'image',
+    onProgress: opts.onProgress,
+    timeoutMs: opts.timeoutMs,
+  });
+  const images = slides.filter((s) => s.dataUrl && s.w > 0 && s.h > 0);
+  if (!images.length) throw new Error('Nothing was captured for image export');
+  if (images.length === 1) {
+    const image = images[0]!;
+    return { dataUrl: image.dataUrl!, w: image.w, h: image.h };
+  }
+
+  const width = Math.max(...images.map((image) => image.w));
+  const height = images.reduce((sum, image) => sum + image.h, 0);
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('Canvas is not available');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, width, height);
+
+  let top = 0;
+  for (const image of images) {
+    const element = await loadImageFromDataUrl(image.dataUrl!);
+    ctx.drawImage(element, 0, top, image.w, image.h);
+    top += image.h;
+  }
+
+  return { dataUrl: canvas.toDataURL('image/png'), w: width, h: height };
+}
+
 /** Programmatic, client-side PDF: image-per-slide (deck) or paginated full page. */
 export async function exportArtifactAsPdf(
   html: string,
   title: string,
-  opts: { deck: boolean; onProgress?: ExportProgress },
+  opts: { deck: boolean; onProgress?: ExportProgress; timeoutMs?: number },
 ): Promise<void> {
   const slides = await captureArtifactSlides(html, {
     deck: opts.deck,
     mode: 'image',
     onProgress: opts.onProgress,
+    timeoutMs: opts.timeoutMs,
   });
   const images = slides.filter((s) => s.dataUrl && s.w > 0 && s.h > 0);
   if (!images.length) throw new Error('Nothing was captured for PDF export');
@@ -1465,4 +1786,27 @@ export async function exportArtifactAsPdf(
     pdf.addImage(img.dataUrl!, 'PNG', 0, -p * pageH, img.w, img.h);
   }
   triggerDownload(pdf.output('blob'), filename);
+}
+
+/** Build a one-image PDF from an already-captured preview snapshot. */
+export async function exportSnapshotAsPdf(
+  snapshot: PreviewSnapshot,
+  title: string,
+): Promise<void> {
+  if (!snapshot.dataUrl || snapshot.w <= 0 || snapshot.h <= 0) {
+    throw new Error('Nothing was captured for PDF export');
+  }
+  const image = await loadImageFromDataUrl(snapshot.dataUrl);
+  const width = snapshot.w || image.naturalWidth || image.width;
+  const height = snapshot.h || image.naturalHeight || image.height;
+  if (width <= 0 || height <= 0) throw new Error('Nothing was captured for PDF export');
+  const { jsPDF } = await import('jspdf');
+  const pdf = new jsPDF({
+    orientation: width >= height ? 'landscape' : 'portrait',
+    unit: 'px',
+    format: [width, height],
+    compress: true,
+  });
+  pdf.addImage(snapshot.dataUrl, 'PNG', 0, 0, width, height);
+  triggerDownload(pdf.output('blob'), `${safeFilename(title, 'artifact')}.pdf`);
 }

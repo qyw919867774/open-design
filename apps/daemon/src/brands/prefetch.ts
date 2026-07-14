@@ -1,8 +1,8 @@
 // @ts-nocheck
 import fs from "node:fs";
 import path from "node:path";
-import { chromeDumpDom, chromeScreenshot, findChrome } from "./chrome.js";
 import { harvestFonts, type FontFile } from "./fonts.js";
+import { fetchExternalBrandAsset } from "./safe-fetch.js";
 
 /**
  * Deterministic brand-material prefetch. Given a site URL, fetch the HTML +
@@ -66,9 +66,10 @@ export type PrefetchResult = {
   paragraphs: string[];
   navLabels: string[];
   extraPages: Array<{ url: string; title: string; text: string }>;
-  /** Path (relative to the brand dir) of a headless-Chrome page screenshot,
-   *  captured when no logo could be downloaded — vision material for the
-   *  synthesis agent. */
+  /** Path (relative to the brand dir) of a page screenshot used as vision
+   *  material for the synthesis agent. Always null server-side now that the
+   *  headless-Chrome capture was removed (it could not be constrained to public
+   *  hosts — SSRF). */
   screenshot: string | null;
   /** True when the harvest looks too thin to synthesize from (likely a
    *  bot-blocked or fully JS-rendered site). The synthesis prompt switches
@@ -84,6 +85,20 @@ export type PrefetchResult = {
 
 export type PrefetchProgress = (step: string, detail?: string) => void;
 
+/** Per-fetch deadline, also abortable by the caller's signal (a user Stop on the
+ *  programmatic pass) so an in-flight request tears down promptly instead of
+ *  running out its full timeout. */
+function fetchDeadline(signal?: AbortSignal | null): AbortSignal {
+  const timeout = AbortSignal.timeout(FETCH_TIMEOUT_MS);
+  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+}
+
+function throwIfPrefetchAborted(signal?: AbortSignal | null): void {
+  if (!signal?.aborted) return;
+  if (typeof signal.throwIfAborted === "function") signal.throwIfAborted();
+  throw signal.reason instanceof Error ? signal.reason : new DOMException("Aborted", "AbortError");
+}
+
 async function fetchText(
   url: string,
   cap: number,
@@ -93,13 +108,14 @@ async function fetchText(
      *  that body is signal (it routes us into the blocked-mode pipeline),
      *  not an error. */
     allowHttpError?: boolean;
+    /** Caller cancellation (user Stop) layered onto the per-fetch timeout. */
+    signal?: AbortSignal;
   },
 ): Promise<{ text: string; finalUrl: string; contentType: string; ok: boolean } | null> {
   try {
-    const res = await fetch(url, {
+    const res = await fetchExternalBrandAsset(url, {
       headers: { "User-Agent": UA, Accept: "text/html,application/xhtml+xml,text/css,*/*" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+      signal: fetchDeadline(opts?.signal),
     });
     if (!res.ok && !opts?.allowHttpError) return null;
     const buf = Buffer.from(await res.arrayBuffer());
@@ -123,10 +139,11 @@ async function fetchText(
 async function fetchBinary(
   url: string,
   referer?: string,
+  signal?: AbortSignal,
 ): Promise<{ buf: Buffer; contentType: string } | null> {
   const attempt = async (): Promise<{ buf: Buffer; contentType: string } | null> => {
     try {
-      const res = await fetch(url, {
+      const res = await fetchExternalBrandAsset(url, {
         headers: {
           "User-Agent": UA,
           Accept: "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
@@ -135,8 +152,7 @@ async function fetchBinary(
           "Sec-Fetch-Site": "cross-site",
           ...(referer ? { Referer: referer } : {}),
         },
-        redirect: "follow",
-        signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+        signal: fetchDeadline(signal),
       });
       if (!res.ok) return null;
       const buf = Buffer.from(await res.arrayBuffer());
@@ -156,16 +172,48 @@ async function fetchBinary(
 
 const CHALLENGE_TITLE_RE =
   /just a moment|attention required|access denied|verifying you are human|checking your browser|security check|please verify|are you a robot|ddos[- ]guard|captcha/i;
-const CHALLENGE_BODY_RE =
-  /challenges\.cloudflare\.com|cf-browser-verification|_cf_chl_opt|cf-turnstile|this website uses a security service|enable javascript and cookies to continue|verify you are human|px-captcha|datadome|_incapsula_|EO_Bot_Ssid|__tst_status/i;
+// Markers that only ever appear on the interstitial itself — the legacy CF
+// verification shell, the challenge opt blob, the "turn on JS and cookies"
+// copy, the PerimeterX/Imperva/EdgeOne block-page resources. Their presence is
+// proof the body IS the wall, never the real site.
+const CHALLENGE_DEFINITIVE_RE =
+  /cf-browser-verification|_cf_chl_opt|this website uses a security service|enable javascript and cookies to continue|verify you are human|px-captcha|_incapsula_|EO_Bot_Ssid|__tst_status/i;
+// Markers a *real* page can legitimately carry: a Cloudflare Turnstile or
+// DataDome widget embedded on a login / subscribe / comment surface. The
+// Economist's homepage, for instance, still references challenges.cloudflare.com
+// once you are past the wall. These count as a challenge ONLY when the page is
+// otherwise content-sparse (a bare verification widget and little else).
+const CHALLENGE_AMBIGUOUS_RE = /challenges\.cloudflare\.com|cf-turnstile|datadome/i;
+
+/** A real interstitial is content-sparse: a verification widget and not much
+ *  else. A real page that merely embeds an anti-bot widget still ships a full
+ *  nav and body. Count the cheap structural signals a harvest feeds on — links,
+ *  headings, paragraphs — to tell the two apart. */
+function looksContentRich(html: string): boolean {
+  const scan = html.slice(0, 400_000);
+  const anchors = (scan.match(/<a\s[^>]*\bhref=/gi) ?? []).length;
+  const headings = (scan.match(/<h[1-3][\s/>]/gi) ?? []).length;
+  const paragraphs = (scan.match(/<p[\s/>]/gi) ?? []).length;
+  return anchors >= 8 || headings >= 3 || (anchors >= 3 && paragraphs >= 3);
+}
 
 /** True when the HTML is a bot-protection interstitial (Cloudflare, DataDome,
  *  PerimeterX, …) rather than the real site. Harvesting one of these poisons
- *  every downstream field — "Just a moment…" becomes the brand name. */
+ *  every downstream field — "Just a moment…" becomes the brand name.
+ *
+ *  The check is deliberately asymmetric: a challenge *title* or a challenge-only
+ *  body marker blocks unconditionally, but an embeddable widget marker
+ *  (Turnstile / DataDome) blocks only when the page is also sparse. That
+ *  asymmetry is what lets the in-app browser's post-wall DOM — a real,
+ *  content-rich page that still references the widget — survive the harvest
+ *  instead of being discarded as if it were the wall itself. */
 export function isChallengePage(html: string): boolean {
   const title = /<title[^>]*>([\s\S]*?)<\/title>/i.exec(html)?.[1] ?? "";
   if (CHALLENGE_TITLE_RE.test(title)) return true;
-  return CHALLENGE_BODY_RE.test(html.slice(0, 60_000));
+  const head = html.slice(0, 60_000);
+  if (CHALLENGE_DEFINITIVE_RE.test(head)) return true;
+  if (CHALLENGE_AMBIGUOUS_RE.test(head)) return !looksContentRich(html);
+  return false;
 }
 
 export function previewablePrefetchHtml(html: string, cap = HTML_CAP): string {
@@ -701,64 +749,53 @@ const EXTRA_PAGE_HINTS = /\/(about|company|pricing|product|features|story|missio
 export async function prefetchBrand(
   url: string,
   brandDir: string,
-  onProgress: PrefetchProgress = () => {},
+  opts: { onProgress?: PrefetchProgress; signal?: AbortSignal } = {},
 ): Promise<PrefetchResult | null> {
+  const onProgress = opts.onProgress ?? (() => {});
+  const { signal } = opts;
+  throwIfPrefetchAborted(signal);
   onProgress("fetch", url);
-  let page = await fetchText(url, HTML_CAP, { allowHttpError: true });
+  let page = await fetchText(url, HTML_CAP, { allowHttpError: true, signal });
+  throwIfPrefetchAborted(signal);
   // A non-2xx body is only useful when it's a bot-wall challenge page (it
   // routes into blocked mode below). A site's own 404/500 page is not the
   // brand — treat that as a failed fetch.
   if (page && !page.ok && !isChallengePage(page.text)) page = null;
+  throwIfPrefetchAborted(signal);
   let html: string;
   let baseUrl: string;
-  let renderedDom: string | null = null; // set once Chrome has rendered the page
   if (page && !isChallengePage(page.text)) {
     html = page.text;
     baseUrl = page.finalUrl;
+  } else if (page) {
+    // Bot-challenge page. The system-Chrome render fallback was removed (a
+    // spawned browser can't be constrained to public hosts — SSRF), so keep
+    // going in blocked mode: the favicon-service logo tier still runs and the
+    // challenge content is discarded below. JS-heavy sites are rendered by the
+    // in-app browser path (prefetchFromHtml), not here.
+    html = page.text;
+    baseUrl = page.finalUrl;
   } else {
-    // Plain fetch blocked or answered with a bot challenge → headless-Chrome
-    // fallback (real browser fingerprint).
-    onProgress(
-      "chrome",
-      page
-        ? "bot challenge detected — rendering with headless Chrome"
-        : "plain fetch blocked — rendering with headless Chrome",
-    );
-    renderedDom = await chromeDumpDom(url);
-    if (renderedDom) {
-      html = renderedDom.slice(0, HTML_CAP);
-      baseUrl = page?.finalUrl ?? url;
-    } else if (page) {
-      // Challenge page and no Chrome render — keep going in blocked mode so
-      // the favicon-service logo tier still runs; the page content itself is
-      // discarded below.
-      html = page.text;
-      baseUrl = page.finalUrl;
-    } else {
-      return null;
-    }
+    // Plain fetch blocked outright with nothing usable.
+    return null;
   }
-  return harvestFromHtml(html, baseUrl, brandDir, { url, renderedDom, onProgress });
+  return harvestFromHtml(html, baseUrl, brandDir, { url, onProgress, signal });
 }
 
 interface HarvestFromHtmlOptions {
   /** Original input URL recorded as `result.url`. */
   url: string;
-  /** Pre-rendered DOM (headless Chrome) captured during fetch, used as a logo
-   *  fallback source. Null for the extract-from-html path. */
-  renderedDom?: string | null;
   /** Extra CSS folded into the harvest before parsing (e.g. stylesheet text the
    *  web read out of the rendered browser page). */
   cssSeed?: string;
-  /** Whether headless-Chrome rescue passes (thin-CSS re-harvest, screenshot) may
-   *  run. False when the caller already supplied rendered DOM. Defaults true. */
-  allowChrome?: boolean;
   onProgress?: PrefetchProgress;
+  /** Caller cancellation (user Stop) threaded into the harvest's sub-fetches. */
+  signal?: AbortSignal;
 }
 
 /** Turn page HTML (+ optional seed CSS) into a PrefetchResult: harvest colors,
  *  fonts, logos, and copy, self-host webfonts, and build the material digest.
- *  `prefetchBrand` feeds fetched / Chrome-rendered HTML; `prefetchFromHtml`
+ *  `prefetchBrand` feeds server-fetched HTML; `prefetchFromHtml`
  *  feeds the DOM the web read out of the unblocked in-app browser tab. */
 async function harvestFromHtml(
   html: string,
@@ -766,12 +803,11 @@ async function harvestFromHtml(
   brandDir: string,
   opts: HarvestFromHtmlOptions,
 ): Promise<PrefetchResult> {
-  const { url } = opts;
+  const { url, signal } = opts;
   const onProgress: PrefetchProgress = opts.onProgress ?? (() => {});
-  const allowChrome = opts.allowChrome ?? true;
-  let renderedDom = opts.renderedDom ?? null;
-  // Chrome can render a challenge page too (interactive Turnstile etc.) —
-  // re-check the HTML we actually ended up with.
+  throwIfPrefetchAborted(signal);
+  // Re-check the HTML we actually ended up with (a challenge page can slip
+  // through when the caller supplies pre-rendered DOM).
   const blocked = isChallengePage(html);
   if (blocked) {
     onProgress("blocked", "anti-bot challenge page — discarding its content from the harvest");
@@ -807,38 +843,18 @@ async function harvestFromHtml(
       }
     }
     const cssResults = await Promise.all(
-      cssLinks.slice(0, MAX_CSS_FILES).map((u) => fetchText(u, CSS_CAP)),
+      cssLinks.slice(0, MAX_CSS_FILES).map((u) => fetchText(u, CSS_CAP, { signal })),
     );
     for (const r of cssResults) if (r) cssChunks.push(r.text);
     // Google Fonts CSS carries the canonical family names — fetch those too.
     const gfResults = await Promise.all(
-      googleFontsUrls.slice(0, 2).map((u) => fetchText(u, CSS_CAP)),
+      googleFontsUrls.slice(0, 2).map((u) => fetchText(u, CSS_CAP, { signal })),
     );
     for (const r of gfResults) if (r) cssChunks.push(r.text);
     allCss = cssChunks.join("\n");
 
     colors = extractColors(allCss);
     ({ fonts, fontFaceFamilies } = extractFonts(allCss));
-
-    // CSS-in-JS rescue: a thin static harvest usually means styles are injected
-    // at runtime. Render once with headless Chrome — the dumped DOM carries the
-    // injected <style> tags and inline styles — and re-extract.
-    if (colors.filter((c) => !c.extreme).length < 3 && !renderedDom && allowChrome && findChrome()) {
-      onProgress("chrome", "thin static CSS — re-harvesting from the rendered DOM");
-      renderedDom = await chromeDumpDom(baseUrl);
-      if (renderedDom) {
-        const domCss: string[] = [];
-        for (const m of renderedDom.matchAll(/<style[^>]*>([\s\S]*?)<\/style>/gi)) domCss.push(m[1]);
-        for (const m of renderedDom.matchAll(/<([a-z][\w:-]*)([^>]{0,2000}?)\sstyle=["']([^"']{1,2000})["'][^>]*>/gi)) {
-          domCss.push(`${inlineStyleSelector(m[1], m[2] ?? '')}{${m[3]};}`);
-        }
-        if (domCss.length) {
-          allCss = [allCss, ...domCss].join("\n");
-          colors = extractColors(allCss);
-          ({ fonts, fontFaceFamilies } = extractFonts(allCss));
-        }
-      }
-    }
   }
   onProgress("styles", `${colors.length} colors, ${fonts.length} fonts`);
 
@@ -877,12 +893,10 @@ async function harvestFromHtml(
       contentType: "image/svg+xml",
     });
   }
-  // The rendered DOM sees lazily-injected header logos the raw HTML may miss.
-  let refs = blocked ? [] : findLogoRefs(html, baseUrl);
-  if (refs.length === 0 && renderedDom && !blocked) refs = findLogoRefs(renderedDom, baseUrl);
+  const refs = blocked ? [] : findLogoRefs(html, baseUrl);
   for (const ref of refs) {
     if (logos.length >= MAX_LOGOS) break;
-    const bin = await fetchBinary(ref.url, baseUrl);
+    const bin = await fetchBinary(ref.url, baseUrl, signal);
     if (!bin) continue;
     const file = `${ref.kind}-${logos.length}${extFor(bin.contentType, ref.url)}`;
     fs.writeFileSync(path.join(logosDir, file), bin.buf);
@@ -908,18 +922,13 @@ async function harvestFromHtml(
     const logoColors = extractLogoSvgColorCandidates(logosDir, logos);
     if (logoColors.length > 0) colors = mergeColorCandidates(colors, logoColors);
   }
-  // Still nothing → grab a page screenshot instead; the synthesis agent Reads
-  // it with vision to locate the logo and judge visual style. Pointless for a
-  // challenge page — the screenshot would show the interstitial.
   const prefetchDir = path.join(brandDir, "prefetch");
   fs.mkdirSync(prefetchDir, { recursive: true });
-  let screenshot: string | null = null;
-  if (logos.length === 0 && !blocked && allowChrome && findChrome()) {
-    onProgress("chrome", "no logo downloadable — capturing a page screenshot");
-    const shotPath = path.join(prefetchDir, "screenshot.png");
-    if (await chromeScreenshot(baseUrl, shotPath)) screenshot = "prefetch/screenshot.png";
-  }
-  onProgress("logos-done", `${logos.length} candidates${screenshot ? " + page screenshot" : ""}`);
+  // The page-screenshot fallback relied on spawning system Chrome, which was
+  // removed (it could not be constrained to public hosts — SSRF), so no
+  // screenshot is captured on the server side.
+  const screenshot: string | null = null;
+  onProgress("logos-done", `${logos.length} candidates`);
 
   // ── copy ──
   // Challenge-page copy ("Just a moment…", "performing security verification")
@@ -958,7 +967,7 @@ async function harvestFromHtml(
   const candidates = navLinks.filter((l) => sameHost(l.url) && EXTRA_PAGE_HINTS.test(l.url));
   for (const cand of candidates.slice(0, MAX_EXTRA_PAGES)) {
     onProgress("extra-page", cand.url);
-    const extra = await fetchText(cand.url, HTML_CAP);
+    const extra = await fetchText(cand.url, HTML_CAP, { signal });
     if (!extra) continue;
     const t = decodeEntities(/<title[^>]*>([\s\S]*?)<\/title>/i.exec(extra.text)?.[1] ?? "").trim();
     const text = [
@@ -997,8 +1006,7 @@ async function harvestFromHtml(
 
   // Persist raw material for the agent to Read deeper if it wants to.
   fs.writeFileSync(path.join(prefetchDir, "material.md"), materialMd);
-  fs.writeFileSync(path.join(prefetchDir, "page.html"), html.slice(0, HTML_CAP));
-  fs.writeFileSync(path.join(prefetchDir, "page-preview.html"), previewablePrefetchHtml(html));
+  fs.writeFileSync(path.join(prefetchDir, "page.html"), previewablePrefetchHtml(html));
   fs.writeFileSync(path.join(prefetchDir, "styles.css"), allCss.slice(0, 2_000_000));
 
   return { ...partial, thin, materialMd };
@@ -1006,7 +1014,7 @@ async function harvestFromHtml(
 
 /** Harvest a brand from HTML the web already rendered (e.g. the in-app browser
  *  tab after the user cleared an anti-bot wall) instead of fetching it. Skips
- *  all main-page network fetching and headless-Chrome rescue; logo/webfont
+ *  main-page network fetching; logo/webfont
  *  downloads still run best-effort against `baseUrl`. Returns null on empty
  *  input. The provided `css` (stylesheet text + computed styles collected from
  *  the rendered page) is folded in alongside the inline `<style>` in `html`. */
@@ -1027,8 +1035,6 @@ export async function prefetchFromHtml(
   return harvestFromHtml(html.slice(0, HTML_CAP), resolvedBase, brandDir, {
     url: baseUrl,
     cssSeed: css ?? "",
-    renderedDom: null,
-    allowChrome: false,
     onProgress,
   });
 }
