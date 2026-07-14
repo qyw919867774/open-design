@@ -173,6 +173,18 @@ export function spawnEnvForAgent(
     }
     return finalizeRuntimeEnv(env, sandboxRuntime);
   }
+  if (agentId === 'dhcoder') {
+    stripKeysCaseInsensitive(env, [
+      'DHCODER',
+      'DHCODER_PID',
+      'DHCODER_RUN_ID',
+      'DHCODER_SERVER_PASSWORD',
+    ]);
+    if (!env.DHCODER_DISABLE_PROJECT_CONFIG?.trim()) {
+      env.DHCODER_DISABLE_PROJECT_CONFIG = 'true';
+    }
+    return finalizeRuntimeEnv(env, sandboxRuntime);
+  }
   return finalizeRuntimeEnv(env, sandboxRuntime);
 }
 

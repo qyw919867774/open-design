@@ -14,6 +14,7 @@ const AGENT_LABELS: Record<string, string> = {
   qoder: 'Qoder',
   copilot: 'Copilot',
   deepseek: 'DeepSeek',
+  dhcoder: 'DHcoder',
   antigravity: 'Antigravity',
   'anthropic-api': 'Anthropic API via OpenCode',
   'openai-api': 'OpenAI API via OpenCode',

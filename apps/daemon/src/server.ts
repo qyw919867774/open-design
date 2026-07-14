@@ -6305,7 +6305,12 @@ export async function startServer({
         // user's saved `~/.config/opencode/opencode.json` continues
         // to apply as-is.
         ...(opencodeConfigContent
-          ? { [isMiMoContent ? 'MIMOCODE_CONFIG_CONTENT' : 'OPENCODE_CONFIG_CONTENT']: opencodeConfigContent }
+          ? {
+              [isMiMoContent ? 'MIMOCODE_CONFIG_CONTENT' : 'OPENCODE_CONFIG_CONTENT']: opencodeConfigContent,
+              ...(def.id === 'dhcoder'
+                ? { DHCODER_CONFIG_CONTENT: opencodeConfigContent }
+                : {}),
+            }
           : {}),
       }, agentLaunch);
       spawnedAgentEnv = env;
