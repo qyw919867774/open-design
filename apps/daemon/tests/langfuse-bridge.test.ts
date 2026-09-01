@@ -3,7 +3,10 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { reportRunCompletedFromDaemon } from '../src/langfuse-bridge.js';
+import {
+  buildSafeRunQualityProjectionFromDaemon,
+  reportRunCompletedFromDaemon,
+} from '../src/langfuse-bridge.js';
 import { buildPromptStackTelemetry } from '../src/prompt-telemetry.js';
 
 interface FakeMessage {
@@ -107,16 +110,93 @@ function bodyOf(
   return event!.body;
 }
 
+const TEST_VELA_TELEMETRY_URL =
+  'https://vela.example.test/api/v1/open-design/telemetry';
+
+function enableTestVelaTelemetry(): void {
+  vi.stubEnv('OPEN_DESIGN_VELA_TELEMETRY', 'on');
+  vi.stubEnv('VELA_CONTROL_KEY', 'ck_test');
+  vi.stubEnv('VELA_API_URL', 'https://vela.example.test');
+}
+
+function velaTraceBody(call: [string, RequestInit]): Record<string, any> {
+  const envelope = JSON.parse(call[1].body as string) as {
+    events: Array<{ kind: string; data: Record<string, any> }>;
+  };
+  const event = envelope.events.find((candidate) => candidate.kind === 'trace');
+  expect(event).toBeTruthy();
+  return event!.data;
+}
+
 describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
   let dataDir: string;
+  let telemetryRelayUrl: string | undefined;
+  let objectRelayUrl: string | undefined;
 
   beforeEach(async () => {
+    telemetryRelayUrl = process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL;
+    objectRelayUrl = process.env.OPEN_DESIGN_OBJECT_RELAY_URL;
+    delete process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL;
+    delete process.env.OPEN_DESIGN_OBJECT_RELAY_URL;
     dataDir = await mkdtemp(path.join(tmpdir(), 'od-bridge-'));
   });
 
+  it('rebuilds Task quality from the same durable message, tool, and manifest facts', async () => {
+    const run = makeRun({
+      status: 'failed',
+      error: 'token=sk-test-1234567890123456789012 /Users/alice/private',
+      errorCode: 'AGENT_EXIT',
+    });
+    const quality = await buildSafeRunQualityProjectionFromDaemon({
+      db: makeDbWithListMessages({
+        'conv-1': [{
+          id: 'user-1',
+          role: 'user',
+          content: 'request',
+          attachments: [{ path: '/Users/alice/private.png', size: 42 }],
+        }, {
+          id: 'msg-1',
+          role: 'assistant',
+          content:
+            'done token=sk-test-1234567890123456789012 <artifact>private body</artifact>',
+          producedFiles: [{ path: '/Users/alice/result.html', size: 84, kind: 'html' }],
+        }],
+      }),
+      dataDir,
+      run,
+      prefs: { metrics: true, content: true, artifactManifest: true },
+      installationId: 'installation-fixture',
+    });
+
+    expect(quality?.result?.output?.text).toContain('[REDACTED:artifact_content]');
+    expect(quality?.result?.error).toMatchObject({ code: 'AGENT_EXIT' });
+    expect(quality?.tools).toHaveLength(2);
+    expect(quality?.manifests).toMatchObject({
+      completeness: 'complete',
+      attachments: [{ object_class: 'attachment', size_bytes: 42 }],
+      artifacts: [{ object_class: 'artifact', size_bytes: 84, type: 'html' }],
+    });
+    const serialized = JSON.stringify(quality);
+    expect(serialized).not.toContain('/Users/alice');
+    expect(serialized).not.toContain('sk-test-');
+    expect(serialized).not.toContain('private body');
+
+    expect(await buildSafeRunQualityProjectionFromDaemon({
+      db: makeDb(),
+      dataDir,
+      run,
+      prefs: { metrics: true, content: false, artifactManifest: true },
+    })).toBeUndefined();
+  });
+
   afterEach(async () => {
+    if (telemetryRelayUrl === undefined) delete process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL;
+    else process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL = telemetryRelayUrl;
+    if (objectRelayUrl === undefined) delete process.env.OPEN_DESIGN_OBJECT_RELAY_URL;
+    else process.env.OPEN_DESIGN_OBJECT_RELAY_URL = objectRelayUrl;
     await rm(dataDir, { recursive: true, force: true });
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   async function writeAppCfg(cfg: Record<string, unknown>) {
@@ -464,6 +544,87 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     });
   });
 
+  it('keeps canonical tool spans without projecting ACP tool snapshot statuses', async () => {
+    await writeAppCfg({
+      installationId: 'install-uuid-1',
+      telemetry: { metrics: true, content: true, artifactManifest: false },
+    });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(new Response('{}', { status: 207 }));
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk';
+    process.env.LANGFUSE_SECRET_KEY = 'sk';
+    try {
+      await reportRunCompletedFromDaemon({
+        db: makeDbWithListMessages({
+          'conv-1': [
+            {
+              id: 'msg-1',
+              role: 'assistant',
+              content: '',
+              producedFiles: [],
+            },
+          ],
+        }),
+        dataDir,
+        run: makeRun({
+          agentId: 'amr',
+          events: [
+            {
+              id: 1,
+              event: 'agent',
+              data: { type: 'status', label: 'initializing' },
+            },
+            {
+              id: 2,
+              event: 'agent',
+              data: { type: 'status', label: 'tool_call' },
+            },
+            {
+              id: 3,
+              event: 'agent',
+              data: {
+                type: 'tool_use',
+                id: 'call-1',
+                name: 'Bash',
+                input: { command: 'pwd' },
+              },
+            },
+            {
+              id: 4,
+              event: 'agent',
+              data: { type: 'status', label: 'tool_call_update' },
+            },
+            {
+              id: 5,
+              event: 'agent',
+              data: {
+                type: 'tool_result',
+                toolUseId: 'call-1',
+                content: '/tmp',
+                isError: false,
+              },
+            },
+          ] as any,
+        }) as any,
+        fetchImpl: fetchSpy as any,
+      });
+    } finally {
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+    }
+
+    const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+    const batch = JSON.parse(init.body as string).batch as any[];
+    expect(bodyOf(batch, 'span-create', 'tool:Bash')).toBeTruthy();
+    expect(bodyOf(batch, 'event-create', 'agent-status:initializing')).toBeTruthy();
+    const names = batch
+      .filter((item) => item.type === 'event-create')
+      .map((item) => item.body.name);
+    expect(names).not.toContain('agent-status:tool_call');
+    expect(names).not.toContain('agent-status:tool_call_update');
+  });
+
   it('marks trace-safe object manifests partial when object accounting is incomplete', async () => {
     await writeAppCfg({
       installationId: 'install-uuid-1',
@@ -517,7 +678,7 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     });
   });
 
-  it('derives production object uploads from the telemetry relay while keeping bodies out of Langfuse', async () => {
+  it('derives authenticated object uploads through Vela while keeping bodies out of telemetry', async () => {
     await writeAppCfg({
       installationId: 'install-uuid-1',
       telemetry: { metrics: true, content: true, artifactManifest: true },
@@ -527,6 +688,9 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     await writeFile(path.join(projectDir, 'brief.txt'), 'private attachment body');
     await writeFile(path.join(projectDir, 'index.html'), '<!doctype html><h1>private artifact</h1>');
     const fetchSpy = vi.fn(async (url: string, init: RequestInit) => {
+      if (url === TEST_VELA_TELEMETRY_URL) {
+        return new Response(JSON.stringify({ ok: true }), { status: 202 });
+      }
       if (url.includes('/api/objects/authorize')) {
         const parsed = JSON.parse(init.body as string) as {
           objects: Array<{ storage_ref: string; sha256: string; size_bytes: number }>;
@@ -557,6 +721,7 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     });
     const priorNodeEnv = process.env.NODE_ENV;
     process.env.NODE_ENV = 'production';
+    enableTestVelaTelemetry();
     process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL = 'https://telemetry.open-design.ai/api/langfuse';
     process.env.LANGFUSE_PUBLIC_KEY = 'pk';
     process.env.LANGFUSE_SECRET_KEY = 'sk';
@@ -603,16 +768,14 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     }
 
     expect(fetchSpy).toHaveBeenCalledTimes(4);
-    expect(fetchSpy.mock.calls[0]![0]).toContain('/api/langfuse');
+    expect(fetchSpy.mock.calls[0]![0]).toBe(TEST_VELA_TELEMETRY_URL);
     expect(fetchSpy.mock.calls[1]![0]).toBe('https://telemetry.open-design.ai/api/objects/authorize');
     expect(fetchSpy.mock.calls[2]![0]).toBe('https://telemetry.open-design.ai/api/objects/batch');
-    expect(fetchSpy.mock.calls[3]![0]).toContain('/api/langfuse');
-    const init = fetchSpy.mock.calls[3]![1] as RequestInit;
-    const langfuseBody = init.body as string;
-    expect(langfuseBody).not.toContain('private attachment body');
-    expect(langfuseBody).not.toContain('<!doctype html><h1>private artifact</h1>');
-    const batch = JSON.parse(langfuseBody).batch as any[];
-    const trace = batch[0].body;
+    expect(fetchSpy.mock.calls[3]![0]).toBe(TEST_VELA_TELEMETRY_URL);
+    const telemetryBody = fetchSpy.mock.calls[3]![1]!.body as string;
+    expect(telemetryBody).not.toContain('private attachment body');
+    expect(telemetryBody).not.toContain('<!doctype html><h1>private artifact</h1>');
+    const trace = velaTraceBody(fetchSpy.mock.calls[3] as [string, RequestInit]);
     expect(trace.metadata.manifest_completeness).toBe('complete');
     expect(trace.metadata.attachment_manifest[0]).toMatchObject({
       object_class: 'attachment',
@@ -628,7 +791,7 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     });
   });
 
-  it('uploads trace objects with worker-issued authority before reporting Langfuse manifests', async () => {
+  it('uploads trace objects with Vela-issued authority before reporting final manifests', async () => {
     await writeAppCfg({
       installationId: 'install-uuid-1',
       telemetry: { metrics: true, content: true, artifactManifest: true },
@@ -646,6 +809,9 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     const tailMarker = 'TAIL_MARKER_SHOULD_NOT_REACH_LANGFUSE';
     const prompt = `${'长'.repeat(70 * 1024)}${tailMarker}`;
     const fetchSpy = vi.fn(async (url: string, init: RequestInit) => {
+      if (url === TEST_VELA_TELEMETRY_URL) {
+        return new Response(JSON.stringify({ ok: true }), { status: 202 });
+      }
       if (url.includes('/api/objects/authorize')) {
         const parsed = JSON.parse(init.body as string) as {
           objects: Array<{ storage_ref: string; sha256: string; size_bytes: number }>;
@@ -682,6 +848,7 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
       return new Response('{}', { status: 207 });
     });
 
+    enableTestVelaTelemetry();
     process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL = 'https://telemetry.open-design.ai/api/langfuse';
     process.env.LANGFUSE_PUBLIC_KEY = 'pk';
     process.env.LANGFUSE_SECRET_KEY = 'sk';
@@ -723,22 +890,23 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     }
 
     expect(fetchSpy).toHaveBeenCalledTimes(4);
-    expect(fetchSpy.mock.calls[0]![0]).toContain('/api/langfuse');
-    const registrationBody = JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string).batch as any[];
-    const registrationTrace = registrationBody[0].body;
+    expect(fetchSpy.mock.calls[0]![0]).toBe(TEST_VELA_TELEMETRY_URL);
+    const registrationTrace = velaTraceBody(
+      fetchSpy.mock.calls[0] as [string, RequestInit],
+    );
+    expect(registrationTrace).not.toHaveProperty('input');
+    expect(registrationTrace).not.toHaveProperty('output');
     expect(registrationTrace.metadata.attachment_manifest[0]).not.toHaveProperty('reason');
     expect(registrationTrace.metadata.artifact_manifest[0]).not.toHaveProperty('reason');
     expect(registrationTrace.metadata.input_text_snapshot_manifest[0]).not.toHaveProperty('reason');
     expect(fetchSpy.mock.calls[1]![0]).toContain('/api/objects/authorize');
     expect(fetchSpy.mock.calls[2]![0]).toContain('/api/objects/batch');
-    expect(fetchSpy.mock.calls[3]![0]).toContain('/api/langfuse');
-    const langfuseInit = fetchSpy.mock.calls[3]![1] as RequestInit;
-    const langfuseBody = langfuseInit.body as string;
-    expect(langfuseBody).not.toContain('attachment body should stay out of langfuse');
-    expect(langfuseBody).not.toContain('<!doctype html><h1>artifact body</h1>');
-    expect(langfuseBody).not.toContain(tailMarker);
-    const batch = JSON.parse(langfuseBody).batch as any[];
-    const trace = batch[0].body;
+    expect(fetchSpy.mock.calls[3]![0]).toBe(TEST_VELA_TELEMETRY_URL);
+    const telemetryBody = fetchSpy.mock.calls[3]![1]!.body as string;
+    expect(telemetryBody).not.toContain('attachment body should stay out of langfuse');
+    expect(telemetryBody).not.toContain('<!doctype html><h1>artifact body</h1>');
+    expect(telemetryBody).not.toContain(tailMarker);
+    const trace = velaTraceBody(fetchSpy.mock.calls[3] as [string, RequestInit]);
     expect(trace.metadata.manifest_completeness).toBe('complete');
     expect(trace.metadata.attachment_manifest).toHaveLength(1);
     expect(trace.metadata.artifact_manifest).toHaveLength(1);
@@ -773,7 +941,7 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     );
   });
 
-  it('registers object upload authority through the object relay when traces use direct Langfuse', async () => {
+  it('reports a consented direct completion without an anonymous registration trace', async () => {
     await writeAppCfg({
       installationId: 'install-uuid-1',
       telemetry: { metrics: true, content: true, artifactManifest: true },
@@ -781,37 +949,175 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     const projectDir = path.join(dataDir, 'projects', 'proj-1');
     await mkdir(projectDir, { recursive: true });
     await writeFile(path.join(projectDir, 'index.html'), '<!doctype html><h1>artifact body</h1>');
-    const fetchSpy = vi.fn(async (url: string, init: RequestInit) => {
-      if (url.includes('/api/objects/authorize')) {
-        const parsed = JSON.parse(init.body as string) as {
-          objects: Array<{ storage_ref: string; object_class: string }>;
-        };
-        expect(parsed.objects).toHaveLength(1);
-        expect(parsed.objects[0]).toMatchObject({ object_class: 'artifact' });
-        return new Response(JSON.stringify({ upload_token: 'upload-token' }), { status: 200 });
-      }
-      if (url.includes('/api/objects/batch')) {
-        const parsed = JSON.parse(init.body as string) as {
-          objects: Array<{ storage_ref: string; content_base64: string }>;
-        };
-        return new Response(
-          JSON.stringify({
-            objects: parsed.objects.map((object) => ({
-              storage_ref: object.storage_ref,
-              status: 'available',
-              size_bytes: Buffer.from(object.content_base64, 'base64').byteLength,
-              sha256: 'sha256:uploaded-artifact',
-            })),
-          }),
-          { status: 200 },
-        );
-      }
-      return new Response('{}', { status: 207 });
-    });
+    const fetchSpy = vi.fn().mockResolvedValue(new Response('{}', { status: 207 }));
 
-    process.env.OPEN_DESIGN_OBJECT_RELAY_URL = 'https://telemetry.open-design.ai/api/objects/batch';
+    const velaTelemetryEnabled = process.env.OPEN_DESIGN_VELA_TELEMETRY;
+    const velaControlKey = process.env.VELA_CONTROL_KEY;
+    const amrHome = process.env.AMR_HOME;
+    process.env.OPEN_DESIGN_VELA_TELEMETRY = 'on';
+    delete process.env.VELA_CONTROL_KEY;
+    process.env.AMR_HOME = path.join(dataDir, 'signed-out-amr-home');
+    process.env.OPEN_DESIGN_OBJECT_RELAY_URL =
+      'https://telemetry.open-design.ai/api/objects/batch';
     process.env.LANGFUSE_PUBLIC_KEY = 'pk';
     process.env.LANGFUSE_SECRET_KEY = 'sk';
+    try {
+      await reportRunCompletedFromDaemon({
+        db: makeDbWithListMessages({
+          'conv-1': [
+            { id: 'user-1', role: 'user', content: 'Build it.' },
+            {
+              id: 'msg-1',
+              role: 'assistant',
+              content: 'done',
+              producedFiles: [{ name: 'index.html', kind: 'html', size: 35 }],
+            },
+          ],
+        }),
+        dataDir,
+        run: makeRun({ userPrompt: 'Build it.' }) as any,
+        fetchImpl: fetchSpy as any,
+      });
+    } finally {
+      if (velaTelemetryEnabled === undefined) delete process.env.OPEN_DESIGN_VELA_TELEMETRY;
+      else process.env.OPEN_DESIGN_VELA_TELEMETRY = velaTelemetryEnabled;
+      if (velaControlKey === undefined) delete process.env.VELA_CONTROL_KEY;
+      else process.env.VELA_CONTROL_KEY = velaControlKey;
+      if (amrHome === undefined) delete process.env.AMR_HOME;
+      else process.env.AMR_HOME = amrHome;
+      delete process.env.OPEN_DESIGN_OBJECT_RELAY_URL;
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+    }
+
+    expect(fetchSpy.mock.calls.map((call) => call[0])).toEqual([
+      'https://us.cloud.langfuse.com/api/public/ingestion',
+    ]);
+    const batch = JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string).batch as any[];
+    const trace = batch[0].body;
+    expect(trace.input).toBe('Build it.');
+    expect(trace.output).toBe('done');
+    expect(trace.metadata.registration_only).not.toBe(true);
+  });
+
+  it('reports a consented relay completion without anonymous registration or object upload', async () => {
+    await writeAppCfg({
+      installationId: 'install-uuid-1',
+      telemetry: { metrics: true, content: true, artifactManifest: true },
+    });
+    const projectDir = path.join(dataDir, 'projects', 'proj-1');
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(path.join(projectDir, 'index.html'), '<!doctype html><h1>artifact body</h1>');
+    const fetchSpy = vi.fn().mockResolvedValue(new Response('{}', { status: 207 }));
+
+    const velaTelemetryEnabled = process.env.OPEN_DESIGN_VELA_TELEMETRY;
+    const velaControlKey = process.env.VELA_CONTROL_KEY;
+    const amrHome = process.env.AMR_HOME;
+    process.env.OPEN_DESIGN_VELA_TELEMETRY = 'on';
+    delete process.env.VELA_CONTROL_KEY;
+    process.env.AMR_HOME = path.join(dataDir, 'signed-out-relay-amr-home');
+    process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL =
+      'https://telemetry.open-design.ai/api/langfuse';
+    process.env.OPEN_DESIGN_OBJECT_RELAY_URL =
+      'https://telemetry.open-design.ai/api/objects/batch';
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk';
+    process.env.LANGFUSE_SECRET_KEY = 'sk';
+    try {
+      await reportRunCompletedFromDaemon({
+        db: makeDbWithListMessages({
+          'conv-1': [
+            { id: 'user-1', role: 'user', content: 'Build it through relay.' },
+            {
+              id: 'msg-1',
+              role: 'assistant',
+              content: 'relay done',
+              producedFiles: [{ name: 'index.html', kind: 'html', size: 35 }],
+            },
+          ],
+        }),
+        dataDir,
+        run: makeRun({ userPrompt: 'Build it through relay.' }) as any,
+        fetchImpl: fetchSpy as any,
+      });
+    } finally {
+      if (velaTelemetryEnabled === undefined) delete process.env.OPEN_DESIGN_VELA_TELEMETRY;
+      else process.env.OPEN_DESIGN_VELA_TELEMETRY = velaTelemetryEnabled;
+      if (velaControlKey === undefined) delete process.env.VELA_CONTROL_KEY;
+      else process.env.VELA_CONTROL_KEY = velaControlKey;
+      if (amrHome === undefined) delete process.env.AMR_HOME;
+      else process.env.AMR_HOME = amrHome;
+      delete process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL;
+      delete process.env.OPEN_DESIGN_OBJECT_RELAY_URL;
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+    }
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy.mock.calls[0]![0]).toBe(
+      'https://telemetry.open-design.ai/api/langfuse',
+    );
+    expect(fetchSpy.mock.calls.some(([url]) => String(url).includes('/api/objects/')))
+      .toBe(false);
+    const batch = JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string).batch as any[];
+    expect(batch.filter((event) => event.type === 'trace-create')).toHaveLength(1);
+    const trace = bodyOf(batch, 'trace-create');
+    expect(trace.input).toBe('Build it through relay.');
+    expect(trace.output).toBe('relay done');
+    expect(trace.metadata).not.toHaveProperty('registration_only');
+  });
+
+  it('registers object authority through Vela without an anonymous trace shell', async () => {
+    await writeAppCfg({
+      installationId: 'install-uuid-1',
+      telemetry: { metrics: true, content: true, artifactManifest: true },
+    });
+    const projectDir = path.join(dataDir, 'projects', 'proj-1');
+    await mkdir(projectDir, { recursive: true });
+    await writeFile(path.join(projectDir, 'index.html'), '<!doctype html><h1>artifact body</h1>');
+
+    const velaEnvelopes: any[] = [];
+    const fetchSpy = vi.fn(async (url: string, init: RequestInit) => {
+      if (url === 'https://vela.example.test/api/v1/open-design/telemetry') {
+        const envelope = JSON.parse(init.body as string);
+        velaEnvelopes.push(envelope);
+        return new Response(JSON.stringify({ ok: true }), { status: 202 });
+      }
+      if (url === 'https://telemetry.open-design.ai/api/objects/authorize') {
+        const parsed = JSON.parse(init.body as string) as {
+          run_id: string;
+          objects: Array<{ storage_ref: string }>;
+        };
+        expect(parsed.run_id).toBe('run-id-1');
+        expect(parsed.objects[0]?.storage_ref).toContain('/runs/run-id-1/');
+        return new Response(JSON.stringify({ upload_token: 'upload-token' }), { status: 200 });
+      }
+      if (url === 'https://telemetry.open-design.ai/api/objects/batch') {
+        const parsed = JSON.parse(init.body as string) as {
+          run_id: string;
+          objects: Array<{ storage_ref: string; content_base64: string }>;
+        };
+        expect(parsed.run_id).toBe('run-id-1');
+        expect(parsed.objects[0]?.storage_ref).toContain('/runs/run-id-1/');
+        return new Response(JSON.stringify({
+          objects: parsed.objects.map((object) => ({
+            storage_ref: object.storage_ref,
+            status: 'available',
+            size_bytes: Buffer.from(object.content_base64, 'base64').byteLength,
+            sha256: 'sha256:uploaded-artifact',
+          })),
+        }), { status: 200 });
+      }
+      throw new Error(`unexpected telemetry request: ${url}`);
+    });
+
+    const velaTelemetryEnabled = process.env.OPEN_DESIGN_VELA_TELEMETRY;
+    const velaControlKey = process.env.VELA_CONTROL_KEY;
+    const velaApiUrl = process.env.VELA_API_URL;
+    process.env.OPEN_DESIGN_VELA_TELEMETRY = 'on';
+    process.env.VELA_CONTROL_KEY = 'ck_test';
+    process.env.VELA_API_URL = 'https://vela.example.test';
+    process.env.OPEN_DESIGN_OBJECT_RELAY_URL =
+      'https://telemetry.open-design.ai/api/objects/batch';
     try {
       await reportRunCompletedFromDaemon({
         db: makeDbWithListMessages({
@@ -830,26 +1136,45 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
         fetchImpl: fetchSpy as any,
       });
     } finally {
+      if (velaTelemetryEnabled === undefined) delete process.env.OPEN_DESIGN_VELA_TELEMETRY;
+      else process.env.OPEN_DESIGN_VELA_TELEMETRY = velaTelemetryEnabled;
+      if (velaControlKey === undefined) delete process.env.VELA_CONTROL_KEY;
+      else process.env.VELA_CONTROL_KEY = velaControlKey;
+      if (velaApiUrl === undefined) delete process.env.VELA_API_URL;
+      else process.env.VELA_API_URL = velaApiUrl;
       delete process.env.OPEN_DESIGN_OBJECT_RELAY_URL;
-      delete process.env.LANGFUSE_PUBLIC_KEY;
-      delete process.env.LANGFUSE_SECRET_KEY;
     }
 
     expect(fetchSpy).toHaveBeenCalledTimes(4);
-    expect(fetchSpy.mock.calls[0]![0]).toBe('https://telemetry.open-design.ai/api/langfuse');
-    expect(fetchSpy.mock.calls[1]![0]).toBe('https://telemetry.open-design.ai/api/objects/authorize');
-    expect(fetchSpy.mock.calls[2]![0]).toBe('https://telemetry.open-design.ai/api/objects/batch');
-    expect(fetchSpy.mock.calls[3]![0]).toBe('https://us.cloud.langfuse.com/api/public/ingestion');
-    const registrationBatch = JSON.parse(fetchSpy.mock.calls[0]![1]!.body as string).batch as any[];
-    const finalBatch = JSON.parse(fetchSpy.mock.calls[3]![1]!.body as string).batch as any[];
-    expect(registrationBatch[0].body.metadata.artifact_manifest[0]).toMatchObject({
-      object_class: 'artifact',
-      storage_ref: expect.stringContaining(
-        'od://objects/workspaces/unknown/projects/proj-1/runs/run-id-1/artifact/',
-      ),
+    expect(velaEnvelopes).toHaveLength(2);
+    expect(fetchSpy.mock.calls.map((call) => call[0])).not.toContain(
+      'https://telemetry.open-design.ai/api/langfuse',
+    );
+
+    const velaRegistrationEvent = velaEnvelopes[0].events.find(
+      (event: { kind: string }) => event.kind === 'trace',
+    );
+    const velaRegistrationTrace = velaRegistrationEvent.data;
+    expect(velaRegistrationTrace.id).toBe('run-id-1');
+    expect(velaRegistrationTrace.metadata.registration_only).toBe(true);
+    expect(velaRegistrationTrace.metadata.artifact_manifest[0]).toMatchObject({
+      run_id: 'run-id-1',
+      storage_ref: expect.stringContaining('/runs/run-id-1/'),
     });
-    expect(finalBatch[0].body.metadata.artifact_manifest[0]).toMatchObject({
-      object_class: 'artifact',
+    expect(velaRegistrationTrace).not.toHaveProperty('input');
+    expect(velaRegistrationTrace).not.toHaveProperty('output');
+
+    const velaFinalEvent = velaEnvelopes[1].events.find(
+      (event: { kind: string }) => event.kind === 'trace',
+    );
+    const velaFinalTrace = velaFinalEvent.data;
+    expect(velaFinalEvent.id).not.toBe(velaRegistrationEvent.id);
+    expect(velaFinalTrace.id).toBe('run-id-1');
+    expect(velaFinalTrace).toHaveProperty('input');
+    expect(velaFinalTrace).toHaveProperty('output');
+    expect(velaFinalTrace.metadata.artifact_manifest[0]).toMatchObject({
+      run_id: 'run-id-1',
+      storage_ref: expect.stringContaining('/runs/run-id-1/'),
       status: 'ok',
       stored_in_open_design: true,
     });
@@ -865,6 +1190,9 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     await writeFile(path.join(projectDir, 'existing.html'), '<!doctype html><h1>modified</h1>');
     const uploadedFilenames: string[] = [];
     const fetchSpy = vi.fn(async (url: string, init: RequestInit) => {
+      if (url === TEST_VELA_TELEMETRY_URL) {
+        return new Response(JSON.stringify({ ok: true }), { status: 202 });
+      }
       if (url.includes('/api/objects/authorize')) {
         return new Response(JSON.stringify({ upload_token: 'upload-token' }), { status: 200 });
       }
@@ -888,6 +1216,7 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
       return new Response('{}', { status: 207 });
     });
 
+    enableTestVelaTelemetry();
     process.env.OPEN_DESIGN_OBJECT_RELAY_URL = 'https://telemetry.open-design.ai/api/objects/batch';
     process.env.LANGFUSE_PUBLIC_KEY = 'pk';
     process.env.LANGFUSE_SECRET_KEY = 'sk';
@@ -923,8 +1252,10 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     }
 
     expect(uploadedFilenames).toEqual(['existing.html']);
-    const finalBatch = JSON.parse(fetchSpy.mock.calls.at(-1)![1]!.body as string).batch as any[];
-    expect(finalBatch[0].body.metadata.trace_object_summary).toEqual({
+    const finalTrace = velaTraceBody(
+      fetchSpy.mock.calls.at(-1) as [string, RequestInit],
+    );
+    expect(finalTrace.metadata.trace_object_summary).toEqual({
       new_file_count: 0,
       modified_file_count: 1,
       recovered_file_count: 0,
@@ -933,7 +1264,7 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
       skipped_file_count: 0,
       skip_reasons: {},
     });
-    expect(finalBatch[0].body.metadata.artifacts).toEqual([
+    expect(finalTrace.metadata.artifacts).toEqual([
       { slug: 'existing.html', type: 'html', sizeBytes: 34 },
     ]);
   });
@@ -947,6 +1278,9 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     await mkdir(projectDir, { recursive: true });
     await writeFile(path.join(projectDir, 'index.html'), '<!doctype html><h1>artifact body</h1>');
     const fetchSpy = vi.fn(async (url: string, init: RequestInit) => {
+      if (url === TEST_VELA_TELEMETRY_URL) {
+        return new Response(JSON.stringify({ ok: true }), { status: 202 });
+      }
       if (url.includes('/api/objects/authorize')) {
         const parsed = JSON.parse(init.body as string) as {
           objects: Array<{ storage_ref: string; object_class: string }>;
@@ -974,6 +1308,7 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
       return new Response('{}', { status: 207 });
     });
 
+    enableTestVelaTelemetry();
     process.env.OPEN_DESIGN_OBJECT_RELAY_URL = 'https://telemetry.open-design.ai/api/objects/batch';
     process.env.OPEN_DESIGN_TELEMETRY_RELAY_URL = 'https://telemetry.open-design.ai/api/langfuse';
     process.env.LANGFUSE_PUBLIC_KEY = 'pk';
@@ -1008,12 +1343,11 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     }
 
     expect(fetchSpy).toHaveBeenCalledTimes(4);
-    expect(fetchSpy.mock.calls[0]![0]).toContain('/api/langfuse');
+    expect(fetchSpy.mock.calls[0]![0]).toBe(TEST_VELA_TELEMETRY_URL);
     expect(fetchSpy.mock.calls[1]![0]).toContain('/api/objects/authorize');
     expect(fetchSpy.mock.calls[2]![0]).toContain('/api/objects/batch');
-    const langfuseInit = fetchSpy.mock.calls[3]![1] as RequestInit;
-    const batch = JSON.parse(langfuseInit.body as string).batch as any[];
-    const trace = batch[0].body;
+    expect(fetchSpy.mock.calls[3]![0]).toBe(TEST_VELA_TELEMETRY_URL);
+    const trace = velaTraceBody(fetchSpy.mock.calls[3] as [string, RequestInit]);
     expect(trace.metadata.manifest_completeness).toBe('partial');
     expect(trace.metadata.attachment_manifest[0]).toMatchObject({
       object_class: 'attachment',
@@ -1360,6 +1694,265 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     expect(payload).not.toContain('<!doctype html>');
   });
 
+  it('redacts lowercase ACP content-tool names like read/write', async () => {
+    await writeAppCfg({
+      installationId: 'install-uuid-1',
+      telemetry: { metrics: true, content: true, artifactManifest: true },
+    });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(new Response('{}', { status: 207 }));
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk';
+    process.env.LANGFUSE_SECRET_KEY = 'sk';
+    const now = Date.now();
+    const toolStartedAt = now - 4000;
+    const toolEndedAt = now - 500;
+    try {
+      await reportRunCompletedFromDaemon({
+        db: makeDbWithListMessages({
+          'conv-1': [
+            {
+              id: 'user-1',
+              role: 'user',
+              content: 'Use this private reference.',
+              attachments: [],
+            },
+            {
+              id: 'msg-1',
+              role: 'assistant',
+              content: 'Done.',
+              producedFiles: [],
+            },
+          ],
+        }),
+        dataDir,
+        run: makeRun({
+          createdAt: now - 4500,
+          updatedAt: now,
+          events: [
+            {
+              id: 1,
+              event: 'agent',
+              // Event log time is late (terminal); startedAt is first frame.
+              timestamp: toolEndedAt,
+              data: {
+                type: 'tool_use',
+                id: 'read-lc',
+                name: 'read',
+                input: { file_path: '/Users/alice/secret.txt', content: 'SECRET_BODY' },
+                startedAt: toolStartedAt,
+              },
+            },
+            {
+              id: 2,
+              event: 'agent',
+              timestamp: toolEndedAt,
+              data: {
+                type: 'tool_result',
+                toolUseId: 'read-lc',
+                content: 'SECRET_BODY',
+                isError: false,
+              },
+            },
+            {
+              id: 3,
+              event: 'agent',
+              timestamp: toolEndedAt,
+              data: {
+                type: 'tool_use',
+                id: 'write-lc',
+                name: 'write',
+                input: { file_path: '/Users/alice/out.html', content: '<html>SECRET</html>' },
+              },
+            },
+            {
+              id: 4,
+              event: 'agent',
+              timestamp: toolEndedAt,
+              data: {
+                type: 'tool_result',
+                toolUseId: 'write-lc',
+                content: 'ok',
+                isError: false,
+              },
+            },
+          ],
+        }) as any,
+        fetchImpl: fetchSpy as any,
+      });
+    } finally {
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+    }
+
+    const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+    const batch = JSON.parse(init.body as string).batch as any[];
+    // Lowercase ACP kind tokens are canonicalized to Title-case family labels.
+    const read = bodyOf(batch, 'span-create', 'tool:Read');
+    const write = bodyOf(batch, 'span-create', 'tool:Write');
+    expect(read.input).toBe('[REDACTED:tool_input:content_tool:Read]');
+    expect(read.output).toBe('[REDACTED:tool_output:content_tool:Read]');
+    expect(write.input).toBe('[REDACTED:tool_input:content_tool:Write]');
+    expect(write.output).toBe('[REDACTED:tool_output:content_tool:Write]');
+    // startedAt on tool_use should drive span startTime earlier than event log ts.
+    expect(new Date(read.startTime).getTime()).toBe(toolStartedAt);
+    const payload = JSON.stringify(batch);
+    expect(payload).not.toContain('SECRET_BODY');
+    expect(payload).not.toContain('<html>SECRET</html>');
+  });
+
+  it('fail-closed redacts kind:other custom ACP tool payloads (unknown tool names)', async () => {
+    await writeAppCfg({
+      installationId: 'install-uuid-1',
+      telemetry: { metrics: true, content: true, artifactManifest: true },
+    });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(new Response('{}', { status: 207 }));
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk';
+    process.env.LANGFUSE_SECRET_KEY = 'sk';
+    const now = Date.now();
+    try {
+      await reportRunCompletedFromDaemon({
+        db: makeDbWithListMessages({
+          'conv-1': [
+            {
+              id: 'user-1',
+              role: 'user',
+              content: 'Read secrets via MCP.',
+              attachments: [],
+            },
+            {
+              id: 'msg-1',
+              role: 'assistant',
+              content: 'Done.',
+              producedFiles: [],
+            },
+          ],
+        }),
+        dataDir,
+        run: makeRun({
+          createdAt: now - 2000,
+          updatedAt: now,
+          events: [
+            {
+              id: 1,
+              event: 'agent',
+              data: {
+                type: 'tool_use',
+                id: 'custom-mcp-1',
+                // ACP kind:other preserves arbitrary adapter/MCP names.
+                name: 'mcp__filesystem__read_file',
+                input: {
+                  path: '/Users/alice/secrets.env',
+                },
+              },
+            },
+            {
+              id: 2,
+              event: 'agent',
+              data: {
+                type: 'tool_result',
+                toolUseId: 'custom-mcp-1',
+                content: 'API_KEY=super-secret\nPASSWORD=also-secret\n',
+                isError: false,
+              },
+            },
+          ],
+        }) as any,
+        fetchImpl: fetchSpy as any,
+      });
+    } finally {
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+    }
+
+    const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+    const batch = JSON.parse(init.body as string).batch as any[];
+    // Span label + toolName metadata use the allowlisted `other` family only.
+    const custom = bodyOf(batch, 'span-create', 'tool:other');
+    expect(custom.metadata.toolName).toBe('other');
+    expect(custom.input).toBe('[REDACTED:tool_input:unknown_tool]');
+    expect(custom.output).toBe('[REDACTED:tool_output:unknown_tool]');
+    const payload = JSON.stringify(batch);
+    expect(payload).not.toContain('super-secret');
+    expect(payload).not.toContain('also-secret');
+    expect(payload).not.toContain('/Users/alice/secrets.env');
+    expect(payload).not.toContain('mcp__filesystem__read_file');
+  });
+
+  it('redacts Linux home paths in ACP Bash tool inputs when content telemetry is on', async () => {
+    await writeAppCfg({
+      installationId: 'install-uuid-1',
+      telemetry: { metrics: true, content: true, artifactManifest: false },
+    });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(new Response('{}', { status: 207 }));
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk';
+    process.env.LANGFUSE_SECRET_KEY = 'sk';
+    const now = Date.now();
+    try {
+      await reportRunCompletedFromDaemon({
+        db: makeDbWithListMessages({
+          'conv-1': [
+            {
+              id: 'user-1',
+              role: 'user',
+              content: 'Check env.',
+              attachments: [],
+            },
+            {
+              id: 'msg-1',
+              role: 'assistant',
+              content: 'Done.',
+              producedFiles: [],
+            },
+          ],
+        }),
+        dataDir,
+        run: makeRun({
+          createdAt: now - 2000,
+          updatedAt: now,
+          events: [
+            {
+              id: 1,
+              event: 'agent',
+              data: {
+                type: 'tool_use',
+                id: 'bash-linux-1',
+                name: 'Bash',
+                input: { command: 'cat /home/alice/.env' },
+              },
+            },
+            {
+              id: 2,
+              event: 'agent',
+              data: {
+                type: 'tool_result',
+                toolUseId: 'bash-linux-1',
+                content: 'KEY=value',
+                isError: false,
+              },
+            },
+          ],
+        }) as any,
+        fetchImpl: fetchSpy as any,
+      });
+    } finally {
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+    }
+
+    const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+    const batch = JSON.parse(init.body as string).batch as any[];
+    const bash = bodyOf(batch, 'span-create', 'tool:Bash');
+    expect(bash.input).toContain('[REDACTED:local_path]');
+    expect(bash.input).toContain('cat');
+    expect(bash.input).not.toContain('/home/alice');
+    expect(JSON.stringify(batch)).not.toContain('/home/alice/.env');
+  });
+
   it('forwards run prompt telemetry into trace and generation metadata', async () => {
     await writeAppCfg({
       installationId: 'install-uuid-1',
@@ -1543,6 +2136,43 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     expect(generation.model).toBe('claude-opus-4-1');
   });
 
+  it('labels a preflight failure with its resolved model and CLI version', async () => {
+    await writeAppCfg({
+      installationId: 'install-uuid-preflight',
+      telemetry: { metrics: true, content: true, artifactManifest: false },
+    });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(new Response('{}', { status: 207 }));
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk';
+    process.env.LANGFUSE_SECRET_KEY = 'sk';
+    try {
+      await reportRunCompletedFromDaemon({
+        db: makeDbWithListMessages({ 'conv-1': [] }),
+        dataDir,
+        run: makeRun({
+          agentId: 'codex',
+          model: 'default',
+          resolvedModelId: 'gpt-5.6-terra',
+          preflightAgentCliVersion: 'codex-cli 0.142.5',
+        }) as any,
+        fetchImpl: fetchSpy as any,
+      });
+    } finally {
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+    }
+    const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+    const batch = JSON.parse(init.body as string).batch as any[];
+    const trace = batch[0].body;
+    const generation = bodyOf(batch, 'generation-create', 'llm');
+
+    expect(trace.metadata.model).toBe('gpt-5.6-terra');
+    expect(trace.metadata.agentCliVersion).toBe('codex-cli 0.142.5');
+    expect(trace.tags).toEqual(expect.arrayContaining(['model:gpt-5.6-terra']));
+    expect(generation.model).toBe('gpt-5.6-terra');
+  });
+
   it('forwards token usage for a totalTokens-only usage event', async () => {
     await writeAppCfg({
       installationId: 'install-uuid-3',
@@ -1588,6 +2218,53 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     expect(trace.metadata.tokens.output).toBeUndefined();
     // …and onto the Langfuse generation usage so cost/token views populate.
     expect(generation.usage.total).toBe(512);
+  });
+
+  it('forwards thought_tokens from ACP-shaped usage into Langfuse metadata', async () => {
+    await writeAppCfg({
+      installationId: 'install-uuid-thought',
+      telemetry: { metrics: true, content: true, artifactManifest: false },
+    });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValue(new Response('{}', { status: 207 }));
+    process.env.LANGFUSE_PUBLIC_KEY = 'pk';
+    process.env.LANGFUSE_SECRET_KEY = 'sk';
+    try {
+      const run = makeRun() as any;
+      run.events = [
+        {
+          id: 1,
+          event: 'agent',
+          timestamp: run.createdAt + 1000,
+          data: {
+            type: 'usage',
+            usage: {
+              input_tokens: 1_000,
+              output_tokens: 50,
+              cached_read_tokens: 200,
+              thought_tokens: 77,
+              total_tokens: 1_127,
+            },
+          },
+        },
+      ];
+      await reportRunCompletedFromDaemon({
+        db: makeDbWithListMessages({ 'conv-1': [] }),
+        dataDir,
+        run,
+        fetchImpl: fetchSpy as any,
+      });
+    } finally {
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+    }
+    const init = fetchSpy.mock.calls[0]![1] as RequestInit;
+    const batch = JSON.parse(init.body as string).batch as any[];
+    const trace = batch[0].body;
+    expect(trace.metadata.tokens.thought).toBe(77);
+    expect(trace.metadata.tokens.total).toBe(1_127);
+    expect(trace.metadata.tokens.cacheReadInput).toBe(200);
   });
 
   it('uses the default model bucket for a default-model run with no status/model event', async () => {
@@ -1731,7 +2408,21 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
             {
               id: 1,
               event: 'error',
-              data: { error: { message: 'agent stream blew up' } },
+              data: {
+                error: {
+                  message: 'agent stream blew up',
+                  details: {
+                    kind: 'opencode_prompt_error',
+                    runtime: 'opencode',
+                    phase: 'timeout',
+                    openCodeSessionId: 'session-must-not-reach-langfuse',
+                    lastEventType: 'tool_call',
+                    lastToolCallId: 'call-must-not-reach-langfuse',
+                    lastToolStatus: 'in_progress',
+                    lastToolKind: 'write',
+                  },
+                },
+              },
             },
           ],
         }) as any,
@@ -1746,6 +2437,14 @@ describe('langfuse-bridge.reportRunCompletedFromDaemon', () => {
     expect(batch[0].body.metadata.status).toBe('failed');
     expect(batch[0].body.metadata.success).toBe(false);
     expect(batch[0].body.metadata.error).toBe('agent stream blew up');
+    expect(batch[0].body.metadata.diagnostics).toMatchObject({
+      amr_opencode_error_phase: 'timeout',
+      amr_opencode_last_event_type: 'tool_call',
+      amr_opencode_last_tool_status: 'in_progress',
+      amr_opencode_last_tool_kind: 'write',
+    });
+    expect(JSON.stringify(batch)).not.toContain('session-must-not-reach-langfuse');
+    expect(JSON.stringify(batch)).not.toContain('call-must-not-reach-langfuse');
     expect(bodyOf(batch, 'span-create', 'agent-run').level).toBe('ERROR');
     expect(bodyOf(batch, 'generation-create', 'llm').level).toBe('ERROR');
     expect(bodyOf(batch, 'generation-create', 'llm').statusMessage).toBe(

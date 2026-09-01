@@ -42,7 +42,7 @@ describe("open-design sidecar contract", () => {
     });
     expect(OPEN_DESIGN_SIDECAR_CONTRACT.updateActions).toBe(DESKTOP_UPDATE_ACTIONS);
     expect(OPEN_DESIGN_SIDECAR_CONTRACT.updateChannels).toBe(DESKTOP_UPDATE_CHANNELS);
-    expect(Object.values(DESKTOP_UPDATE_CHANNELS)).toEqual(["beta", "betas", "prerelease", "preview", "stable"]);
+    expect(Object.values(DESKTOP_UPDATE_CHANNELS)).toEqual(["beta", "prerelease", "stable"]);
     expect(OPEN_DESIGN_SIDECAR_CONTRACT.updateModes).toBe(DESKTOP_UPDATE_MODES);
     expect(OPEN_DESIGN_SIDECAR_CONTRACT.updateStates).toBe(DESKTOP_UPDATE_STATES);
   });
@@ -92,6 +92,27 @@ describe("open-design sidecar contract", () => {
     expect(normalizeDaemonSidecarMessage(message)).toEqual(message);
   });
 
+  it("accepts only loopback HTTP origins for packaged web registration", () => {
+    const message = {
+      input: { url: "http://127.0.0.1:64248" },
+      type: SIDECAR_MESSAGES.REGISTER_WEB_URL,
+    };
+    expect(normalizeDaemonSidecarMessage(message)).toEqual(message);
+
+    expect(() =>
+      normalizeDaemonSidecarMessage({
+        input: { url: "https://open-design.ai" },
+        type: SIDECAR_MESSAGES.REGISTER_WEB_URL,
+      }),
+    ).toThrow(/loopback|http/i);
+    expect(() =>
+      normalizeDaemonSidecarMessage({
+        input: { url: "http://127.0.0.1:64248/projects/project-1" },
+        type: SIDECAR_MESSAGES.REGISTER_WEB_URL,
+      }),
+    ).toThrow(/origin/i);
+  });
+
   it("rejects malformed mint-import-token payloads", () => {
     expect(() =>
       normalizeDaemonSidecarMessage({
@@ -130,6 +151,17 @@ describe("open-design sidecar contract", () => {
 
   it("validates desktop IPC message inputs", () => {
     expect(normalizeDesktopSidecarMessage({ type: SIDECAR_MESSAGES.SHOW })).toEqual({ type: "show" });
+    expect(normalizeDesktopSidecarMessage({
+      input: { deeplinkUrl: "opendesign://workspace/invite/continue?nonce=hot" },
+      type: SIDECAR_MESSAGES.SHOW,
+    })).toEqual({
+      input: { deeplinkUrl: "opendesign://workspace/invite/continue?nonce=hot" },
+      type: "show",
+    });
+    expect(() => normalizeDesktopSidecarMessage({
+      input: { deeplinkUrl: "https://example.com/invite" },
+      type: SIDECAR_MESSAGES.SHOW,
+    })).toThrow(/opendesign scheme/);
     expect(normalizeDesktopSidecarMessage({ input: { expression: "location.href" }, type: SIDECAR_MESSAGES.EVAL })).toEqual({
       input: { expression: "location.href" },
       type: "eval",
@@ -304,6 +336,47 @@ describe("open-design sidecar contract", () => {
         type: SIDECAR_MESSAGES.RENDER_SLIDES,
       }),
     ).toThrow();
+  });
+
+  it("validates deterministic desktop frame-render IPC inputs", () => {
+    expect(
+      normalizeDesktopSidecarMessage({
+        input: {
+          baseHref: "file:///project/composition/",
+          fps: 30,
+          height: 720,
+          html: "<!doctype html><main data-composition-id=\"main\"></main>",
+          outputDir: "/tmp/open-design-frames",
+          width: 1280,
+        },
+        type: SIDECAR_MESSAGES.RENDER_FRAMES,
+      }),
+    ).toEqual({
+      input: {
+        baseHref: "file:///project/composition/",
+        fps: 30,
+        height: 720,
+        html: "<!doctype html><main data-composition-id=\"main\"></main>",
+        outputDir: "/tmp/open-design-frames",
+        width: 1280,
+      },
+      type: "render-frames",
+    });
+
+    for (const input of [
+      { fps: 0, height: 720, html: "<p>x</p>", outputDir: "/tmp/x", width: 1280 },
+      { fps: 241, height: 720, html: "<p>x</p>", outputDir: "/tmp/x", width: 1280 },
+      { height: 0, html: "<p>x</p>", outputDir: "/tmp/x", width: 1280 },
+      { height: 720, html: "", outputDir: "/tmp/x", width: 1280 },
+      { height: 720, html: "<p>x</p>", outputDir: "relative", width: 1280 },
+      { height: 720, html: "<p>x</p>", outputDir: "/tmp/x", width: 8193 },
+      { bogus: true, height: 720, html: "<p>x</p>", outputDir: "/tmp/x", width: 1280 },
+    ]) {
+      expect(() => normalizeDesktopSidecarMessage({
+        input,
+        type: SIDECAR_MESSAGES.RENDER_FRAMES,
+      })).toThrow();
+    }
   });
 
   it("accepts PNG/JPEG artifact image export and rejects WebP up front", () => {

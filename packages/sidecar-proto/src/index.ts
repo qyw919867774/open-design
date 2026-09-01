@@ -88,6 +88,8 @@ export const SIDECAR_MESSAGES = Object.freeze({
   EXPORT_PDF: "export-pdf",
   MINT_IMPORT_TOKEN: "mint-import-token",
   REGISTER_DESKTOP_AUTH: "register-desktop-auth",
+  REGISTER_WEB_URL: "register-web-url",
+  RENDER_FRAMES: "render-frames",
   RENDER_SLIDES: "render-slides",
   SCREENSHOT: "screenshot",
   SHUTDOWN: "shutdown",
@@ -98,6 +100,7 @@ export const SIDECAR_MESSAGES = Object.freeze({
 
 export const DESKTOP_UPDATE_ACTIONS = Object.freeze({
   CHECK: "check",
+  CLEAR_CACHE: "clear-cache",
   DOWNLOAD: "download",
   INSTALL: "install",
   STATUS: "status",
@@ -114,9 +117,7 @@ export type DesktopUpdateMode = (typeof DESKTOP_UPDATE_MODES)[keyof typeof DESKT
 
 export const DESKTOP_UPDATE_CHANNELS = Object.freeze({
   BETA: RELEASE_CHANNELS.BETA,
-  BETAS: RELEASE_CHANNELS.BETAS,
   PRERELEASE: RELEASE_CHANNELS.PRERELEASE,
-  PREVIEW: RELEASE_CHANNELS.PREVIEW,
   STABLE: RELEASE_CHANNELS.STABLE,
 } as const);
 
@@ -185,6 +186,10 @@ export type WebStatusSnapshot = {
 export type DesktopRuntimeState = "idle" | "running" | "unknown";
 
 export type DesktopStatusSnapshot = {
+  capabilities?: {
+    /** Hidden Electron Chromium can deterministically capture authored frame timelines. */
+    frameRenderer?: boolean;
+  };
   pid?: number | null;
   state: DesktopRuntimeState;
   title?: string | null;
@@ -318,6 +323,41 @@ export type DesktopRenderSlidesResult = {
   width?: number;
 };
 
+/**
+ * Render a deterministic HTML timeline through the Electron Chromium already
+ * shipped with the desktop app. The document must expose
+ * `window.__odFrameRenderer = { ready(), seek(timeSeconds, frameIndex) }`.
+ * Desktop owns capture; daemon owns MP4 encoding and scratch cleanup.
+ */
+export type DesktopRenderFramesInput = {
+  baseHref?: string;
+  fps?: number;
+  height: number;
+  html: string;
+  outputDir: string;
+  width: number;
+};
+
+export type DesktopRenderFramesErrorCode =
+  | "AUDIO_UNSUPPORTED"
+  | "FRAME_RENDERER_NOT_READY"
+  | "INVALID_FRAME_METADATA"
+  | "RENDER_FAILED"
+  | "RENDER_TIMEOUT";
+
+export type DesktopRenderFramesResult = {
+  duration?: number;
+  error?: string;
+  errorCode?: DesktopRenderFramesErrorCode;
+  fps?: number;
+  frameCount?: number;
+  /** Absolute printf-style path, for example `/tmp/render/frame-%08d.png`. */
+  framePattern?: string;
+  height?: number;
+  ok: boolean;
+  width?: number;
+};
+
 export type DesktopExportArtifactFormat = "pdf" | "image";
 // Electron's `nativeImage` (the off-screen renderer the programmatic exporter
 // uses) can only encode PNG and JPEG. WebP is deliberately excluded so a caller
@@ -420,7 +460,7 @@ export type DesktopUpdateIncomingSnapshot = {
   version: string;
 };
 
-export type DesktopUpdateCacheLifecycleTrigger = "cold-start" | "next-version-ready";
+export type DesktopUpdateCacheLifecycleTrigger = "cold-start" | "manual" | "next-version-ready";
 
 export type DesktopUpdateReleaseLifecycleState =
   | "cleanup-deferred"
@@ -448,6 +488,30 @@ export type DesktopUpdateCacheSnapshot = {
   lifecycle?: DesktopUpdateCacheLifecycleSummary;
 };
 
+export const DESKTOP_UPDATE_REINSTALL_REASONS = Object.freeze({
+  LAUNCHER_SCHEMA: "launcher-schema",
+  OUTER_BELOW_MIN: "outer-below-min",
+  OUTER_VERSION_UNREADABLE: "outer-version-unreadable",
+} as const);
+
+export type DesktopUpdateReinstallReason =
+  (typeof DESKTOP_UPDATE_REINSTALL_REASONS)[keyof typeof DESKTOP_UPDATE_REINSTALL_REASONS];
+
+/**
+ * Present on a status snapshot when the release feed requires a full installer
+ * reinstall instead of an in-place payload update. `installedVersion` is the
+ * physically installed outer package version (not the running payload version);
+ * it is omitted when the outer bundle config could not be read. `url` is an
+ * optional operator-supplied explanation link from
+ * `control.launcher.version.url`.
+ */
+export type DesktopUpdateReinstallSnapshot = {
+  installedVersion?: string;
+  minVersion?: string;
+  reason: DesktopUpdateReinstallReason;
+  url?: string;
+};
+
 export type DesktopUpdateStatusSnapshot = {
   active?: DesktopUpdateReleaseSnapshot;
   arch: string;
@@ -470,6 +534,7 @@ export type DesktopUpdateStatusSnapshot = {
   paths?: DesktopUpdatePathSnapshot;
   platform: string;
   progress?: DesktopUpdateProgressSnapshot;
+  reinstall?: DesktopUpdateReinstallSnapshot;
   state: DesktopUpdateState;
   supported: boolean;
 };
@@ -485,9 +550,13 @@ export type SidecarShutdownMessage = { type: typeof SIDECAR_MESSAGES.SHUTDOWN };
 export type DesktopEvalMessage = { input: DesktopEvalInput; type: typeof SIDECAR_MESSAGES.EVAL };
 export type DesktopScreenshotMessage = { input: DesktopScreenshotInput; type: typeof SIDECAR_MESSAGES.SCREENSHOT };
 export type DesktopConsoleMessage = { type: typeof SIDECAR_MESSAGES.CONSOLE };
-export type DesktopShowMessage = { type: typeof SIDECAR_MESSAGES.SHOW };
+export type DesktopShowInput = {
+  deeplinkUrl?: string;
+};
+export type DesktopShowMessage = { input?: DesktopShowInput; type: typeof SIDECAR_MESSAGES.SHOW };
 export type DesktopClickMessage = { input: DesktopClickInput; type: typeof SIDECAR_MESSAGES.CLICK };
 export type DesktopExportPdfMessage = { input: DesktopExportPdfInput; type: typeof SIDECAR_MESSAGES.EXPORT_PDF };
+export type DesktopRenderFramesMessage = { input: DesktopRenderFramesInput; type: typeof SIDECAR_MESSAGES.RENDER_FRAMES };
 export type DesktopRenderSlidesMessage = { input: DesktopRenderSlidesInput; type: typeof SIDECAR_MESSAGES.RENDER_SLIDES };
 export type DesktopExportArtifactMessage = { input: DesktopExportArtifactInput; type: typeof SIDECAR_MESSAGES.EXPORT_ARTIFACT };
 export type DesktopUpdateMessage = { input: DesktopUpdateInput; type: typeof SIDECAR_MESSAGES.UPDATE };
@@ -528,11 +597,30 @@ export type MintImportTokenResult =
   | { ok: false; code: "DESKTOP_AUTH_INACTIVE"; message: string; retryable: false }
   | { ok: false; code: "DESKTOP_AUTH_PENDING"; message: string; retryable: true };
 
+/**
+ * Registers the browser-facing URL after a packaged web sidecar has bound its
+ * dynamic port. The message travels over the namespace-scoped daemon IPC, so
+ * it cannot accidentally update another packaged runtime.
+ */
+export type RegisterWebUrlInput = {
+  url: string;
+};
+
+export type RegisterWebUrlMessage = {
+  input: RegisterWebUrlInput;
+  type: typeof SIDECAR_MESSAGES.REGISTER_WEB_URL;
+};
+
+export type RegisterWebUrlResult = {
+  accepted: true;
+};
+
 export type DaemonSidecarMessage =
   | SidecarStatusMessage
   | SidecarShutdownMessage
   | RegisterDesktopAuthMessage
-  | MintImportTokenMessage;
+  | MintImportTokenMessage
+  | RegisterWebUrlMessage;
 export type WebSidecarMessage = SidecarStatusMessage | SidecarShutdownMessage;
 export type DesktopSidecarMessage =
   | SidecarStatusMessage
@@ -543,12 +631,19 @@ export type DesktopSidecarMessage =
   | DesktopShowMessage
   | DesktopClickMessage
   | DesktopExportPdfMessage
+  | DesktopRenderFramesMessage
   | DesktopRenderSlidesMessage
   | DesktopExportArtifactMessage
   | DesktopUpdateMessage;
 
 export type ShutdownResult = {
   accepted: true;
+  /**
+   * When true, the sidecar accepted shutdown but is holding process exit for
+   * critical work (for example a handoff journal commit). The owner should
+   * wait a longer bounded grace for self-exit before force-stopping.
+   */
+  deferred?: boolean;
 };
 
 export type SidecarStamp = {
@@ -733,6 +828,39 @@ function normalizeMintImportTokenInput(input: unknown): MintImportTokenInput {
   return { baseDir: normalizeNonEmptyString(value.baseDir, "mint-import-token baseDir") };
 }
 
+function normalizeRegisterWebUrlInput(input: unknown): RegisterWebUrlInput {
+  const value = assertObject(input, "register-web-url input");
+  assertKnownKeys(value, ["url"], "register-web-url input");
+  const raw = normalizeNonEmptyString(value.url, "register-web-url url");
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("register-web-url url must be an absolute URL");
+  }
+  if (parsed.protocol !== "http:") {
+    throw new Error("register-web-url url must use HTTP");
+  }
+  const hostname = parsed.hostname.toLowerCase();
+  if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "[::1]") {
+    throw new Error("register-web-url url must use a loopback host");
+  }
+  const port = Number(parsed.port);
+  if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+    throw new Error("register-web-url url must include a valid explicit port");
+  }
+  if (
+    parsed.username
+    || parsed.password
+    || parsed.pathname !== "/"
+    || parsed.search
+    || parsed.hash
+  ) {
+    throw new Error("register-web-url url must be a bare origin");
+  }
+  return { url: parsed.origin };
+}
+
 function normalizeBoolean(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") throw new Error(`${label} must be a boolean`);
   return value;
@@ -795,6 +923,32 @@ function normalizeDesktopRenderSlidesInput(input: unknown): DesktopRenderSlidesI
   };
 }
 
+function normalizeDesktopRenderFramesInput(input: unknown): DesktopRenderFramesInput {
+  const value = assertObject(input, "desktop render frames input");
+  assertKnownKeys(value, ["baseHref", "fps", "height", "html", "outputDir", "width"], "desktop render frames input");
+  const outputDir = normalizeNonEmptyString(value.outputDir, "desktop render frames outputDir");
+  if (!/^(\/|[A-Za-z]:[\\/]|\\\\)/.test(outputDir)) {
+    throw new Error("desktop render frames outputDir must be an absolute path");
+  }
+  const width = normalizeOptionalPositiveNumber(value.width, "desktop render frames width")!;
+  const height = normalizeOptionalPositiveNumber(value.height, "desktop render frames height")!;
+  if (width > 8192 || height > 8192) {
+    throw new Error("desktop render frames dimensions must not exceed 8192px");
+  }
+  const fps = normalizeOptionalPositiveNumber(value.fps, "desktop render frames fps");
+  if (fps != null && fps > 240) {
+    throw new Error("desktop render frames fps must not exceed 240");
+  }
+  return {
+    ...(value.baseHref == null ? {} : { baseHref: normalizeNonEmptyString(value.baseHref, "desktop render frames baseHref") }),
+    ...(fps == null ? {} : { fps }),
+    height,
+    html: normalizeNonEmptyString(value.html, "desktop render frames html"),
+    outputDir,
+    width,
+  };
+}
+
 function normalizeOptionalPositiveNumber(value: unknown, label: string): number | undefined {
   if (value == null) return undefined;
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
@@ -827,7 +981,7 @@ function normalizeDesktopExportArtifactInput(input: unknown): DesktopExportArtif
   };
 }
 
-function isDesktopUpdateAction(value: unknown): value is DesktopUpdateAction {
+export function isDesktopUpdateAction(value: unknown): value is DesktopUpdateAction {
   return Object.values(DESKTOP_UPDATE_ACTIONS).includes(value as DesktopUpdateAction);
 }
 
@@ -838,6 +992,17 @@ function normalizeDesktopUpdateInput(input: unknown): DesktopUpdateInput {
     throw new Error(`unsupported desktop update action: ${String(value.action)}`);
   }
   return { action: value.action };
+}
+
+function normalizeDesktopShowInput(input: unknown): DesktopShowInput {
+  const value = assertObject(input, "desktop show input");
+  assertKnownKeys(value, ["deeplinkUrl"], "desktop show input");
+  if (value.deeplinkUrl == null) return {};
+  const deeplinkUrl = normalizeNonEmptyString(value.deeplinkUrl, "desktop show deeplinkUrl");
+  if (!deeplinkUrl.startsWith("opendesign://")) {
+    throw new Error("desktop show deeplinkUrl must use the opendesign scheme");
+  }
+  return { deeplinkUrl };
 }
 
 function normalizeMessageType(value: unknown, label: string): string {
@@ -862,6 +1027,10 @@ export function normalizeDaemonSidecarMessage(input: unknown): DaemonSidecarMess
     assertKnownKeys(value, ["input", "type"], "daemon sidecar message");
     return { input: normalizeMintImportTokenInput(value.input), type };
   }
+  if (type === SIDECAR_MESSAGES.REGISTER_WEB_URL) {
+    assertKnownKeys(value, ["input", "type"], "daemon sidecar message");
+    return { input: normalizeRegisterWebUrlInput(value.input), type };
+  }
   throw new SidecarContractError(SIDECAR_ERROR_CODES.UNKNOWN_MESSAGE, `unknown daemon sidecar message: ${type}`);
 }
 
@@ -882,9 +1051,13 @@ export function normalizeDesktopSidecarMessage(input: unknown): DesktopSidecarMe
     case SIDECAR_MESSAGES.STATUS:
     case SIDECAR_MESSAGES.SHUTDOWN:
     case SIDECAR_MESSAGES.CONSOLE:
-    case SIDECAR_MESSAGES.SHOW:
       assertKnownKeys(value, ["type"], "desktop sidecar message");
       return { type };
+    case SIDECAR_MESSAGES.SHOW:
+      assertKnownKeys(value, ["input", "type"], "desktop sidecar message");
+      return value.input == null
+        ? { type }
+        : { input: normalizeDesktopShowInput(value.input), type };
     case SIDECAR_MESSAGES.EVAL:
       assertKnownKeys(value, ["input", "type"], "desktop sidecar message");
       return { input: normalizeDesktopEvalInput(value.input), type };
@@ -897,6 +1070,9 @@ export function normalizeDesktopSidecarMessage(input: unknown): DesktopSidecarMe
     case SIDECAR_MESSAGES.EXPORT_PDF:
       assertKnownKeys(value, ["input", "type"], "desktop sidecar message");
       return { input: normalizeDesktopExportPdfInput(value.input), type };
+    case SIDECAR_MESSAGES.RENDER_FRAMES:
+      assertKnownKeys(value, ["input", "type"], "desktop sidecar message");
+      return { input: normalizeDesktopRenderFramesInput(value.input), type };
     case SIDECAR_MESSAGES.RENDER_SLIDES:
       assertKnownKeys(value, ["input", "type"], "desktop sidecar message");
       return { input: normalizeDesktopRenderSlidesInput(value.input), type };
